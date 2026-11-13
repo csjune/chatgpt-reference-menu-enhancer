@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<title>참조 메뉴 로컬 검증</title>
+<style>
+  body { margin:32px; font:16px/1.5 sans-serif; color:#202128; background:#f5f6f8; }
+  h1 { font-size:24px; } p { max-width:900px; }
+  button { padding:8px 14px; }
+  [role=menu] { margin-top:20px; width:550px; height:520px; overflow:auto; background:white;
+    border:1px solid #ccd0d8; border-radius:12px; }
+  [role=menuitem] { display:flex; align-items:center; gap:12px; padding:12px; cursor:pointer; }
+  [role=menuitem]:hover, [role=menuitem]:focus { background:#e8efff; outline:none; }
+  #mention-host { position:relative; }
+  #mention-list { position:absolute; left:0; top:4px; width:320px; max-height:240px; overflow:auto; background:white;
+    border:1px solid #ccd0d8; border-radius:12px; padding:4px; z-index:5; }
+  #mention-list [data-list-navigation-item] { display:flex; align-items:center; gap:8px; width:100%; text-align:left; border:0; background:none; padding:6px 10px; border-radius:8px; cursor:pointer; }
+  #composer-pills .pill { display:inline-flex; align-items:center; gap:4px; padding:2px 8px; margin:4px; border-radius:999px; background:#e8efff; }
+  #composer-pills .app-icon, #mention-list .app-icon { display:flex; align-items:center; justify-content:center; width:20px; height:20px; flex-shrink:0; }
+  #mention-list [data-list-navigation-item][aria-current=true] { background:#e8efff; }
+  html.dark #mention-list { background:#202328; }
+  [data-leading-icon-slot] { position:relative; width:24px; height:24px; flex-shrink:0; border-radius:50%; background:#dce5ff; }
+  #result { margin-top:10px; }
+  html.dark { --main-surface-primary:#17191c; --text-primary:#eee; }
+  html.dark body { background:#17191c; color:#eee; }
+  html.dark [role=menu] { background:#202328; }
+  html.dark [role=menuitem]:hover, html.dark [role=menuitem]:focus { background:#303a50; }
+</style>
+<h1>참조 메뉴 · 로컬 검증</h1>
+<p>모의 참조 120개로 검색·스크롤·큰 이미지 팝업·메뉴 재열기를 확인하는 화면이야. 외부 서비스나 실제 ChatGPT 계정으로 요청하지 않아.</p>
+<button id="open" aria-label="사용된 참고 자료 1개 보기" aria-controls="fixture-menu">참조 목록 열기</button>
+<button id="close">목록 닫기</button>
+<button id="change">서버 목록 변경</button>
+<button id="pause">최신 조회 일시 정지</button>
+<button id="resume">최신 조회 재개</button>
+<button id="other-chat">다른 채팅으로 이동</button>
+<button id="source-chat">캐싱 채팅으로 돌아가기</button>
+<button id="delete-chat">이 채팅 삭제 (모의)</button>
+<button id="theme">어두운 테마로 전환</button>
+<button id="inspect">미리보기 캐시 확인</button>
+<label>목록 밖 입력 <input id="outside-focus" placeholder="포커스 이동·바깥 클릭 확인"></label>
+<label>입력창(@ 후보) <input id="composer" placeholder="@를 입력하면 참조 후보가 떠" autocomplete="off"></label>
+<div id="composer-pills"></div>
+<div id="mention-host"></div>
+<div id="result">선택 0회</div>
+<div id="network">목록 요청 0 · 취소 0 · 이미지 0</div>
+<output id="preview-cache"></output>
+<output id="preview-total"></output>
+<main id="host"></main>
+<script>
+  if(location.pathname==='/')history.replaceState(null,'','/c/fixture-cache'+location.search);
+  const uiLanguage=new URL(location.href).searchParams.get('lang');
+  if(uiLanguage)document.documentElement.lang=uiLanguage;
+  const localFetch = window.fetch.bind(window);
+  const shape = new URL(location.href).searchParams.get('shape') || 'portrait';
+  const [imageWidth,imageHeight] = ({portrait:[600,800],wide:[1200,600],tall:[200,2400],square:[800,800]})[shape] || [600,800];
+  const items = Array.from({length:120}, (_,i) => ({
+    id:'AccountUserId_fixture~refimage_'+i, entity_name:'R'+String(i).padStart(4,'0')+'__샘플-참조__기본',
+    entity_type:'asset', asset_pointer:'sediment://file_demo'+i+(shape==='portrait'?'':'_'+shape)+(new URL(location.href).searchParams.has('lifecycle')?'_lifecycle011':'')+(new URL(location.href).searchParams.has('counts')?'_counts0115':''),
+  }));
+  const canvas = document.createElement('canvas'); canvas.width=imageWidth; canvas.height=imageHeight;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(imageWidth/600,imageHeight/800);
+  ctx.fillStyle='#eff1ff'; ctx.fillRect(0,0,600,800);
+  ctx.fillStyle='#4859b8'; ctx.font='28px sans-serif'; ctx.textAlign='center'; ctx.fillText('LOCAL PREVIEW TEST',300,65);
+  ctx.beginPath(); ctx.arc(300,210,50,0,Math.PI*2); ctx.fill();
+  ctx.strokeStyle='#6576d4'; ctx.lineWidth=36; ctx.lineCap='round'; ctx.beginPath();
+  for(const [a,b,c,d] of [[300,270,300,470],[300,310,170,420],[300,310,430,190],[300,470,180,660],[300,470,425,660]]) {
+    ctx.moveTo(a,b); ctx.lineTo(c,d);
+  }
+  ctx.stroke(); ctx.fillText(imageWidth+' × '+imageHeight+' · full image',300,750);
+  const image = localFetch(canvas.toDataURL('image/png')).then(response=>response.blob());
+  window.fixtureCalls = { pages:0, images:0, lookups:0, selections:0, aborted:0 };
+  const network=()=>document.querySelector('#network').textContent='목록 요청 '+window.fixtureCalls.pages+' · 취소 '+window.fixtureCalls.aborted+' · 이미지 '+window.fixtureCalls.images;
+  // Adversarial order: the app's window listener is registered BEFORE the userscript.
+  // Document-level event blocking is too late to prevent this callback from scheduling an open.
+  const earlyTrigger=document.querySelector('#open');
+  let earlyHoverTimer;
+  const nativeHoverProps=Object.freeze({
+    onPointerEnter:()=>{clearTimeout(earlyHoverTimer);earlyHoverTimer=setTimeout(()=>earlyTrigger.click(),200)},
+    onPointerMove:()=>{clearTimeout(earlyHoverTimer);earlyHoverTimer=setTimeout(()=>earlyTrigger.click(),200)},
+    onPointerLeave:()=>clearTimeout(earlyHoverTimer),
+  });
+  earlyTrigger.__reactProps$hoverFixture=nativeHoverProps;
+  function resetHoverProps(open){
+    earlyTrigger.__reactProps$hoverFixture={...nativeHoverProps};
+    earlyTrigger.setAttribute('aria-expanded',String(open));
+  }
+  for(const [type,prop] of [['pointerover','onPointerEnter'],['pointermove','onPointerMove'],['pointerout','onPointerLeave']]){
+    window.addEventListener(type,event=>{
+      if(event.target.closest?.('button')===earlyTrigger)earlyTrigger.__reactProps$hoverFixture[prop](event);
+    },true);
+  }
+  // Read DOM-side props at dispatch time, like React's delegated blur handlers.
+  // These listeners precede the userscript's menu mounting.
+  for(const capture of [true,false])document.addEventListener('focusout',event=>{
+    const menu=event.target.closest?.('[role="menu"]');
+    menu?.__reactProps$focusFixture?.[capture?'onBlurCapture':'onBlur']?.(event);
+  },capture);
+  // The app's native outside-pointer path is independent of its blur callbacks.
+  document.addEventListener('pointerdown',originalEvent=>{
+    const menu=document.querySelector('#fixture-menu');
+    if(!menu||menu.contains(originalEvent.target)||earlyTrigger.contains(originalEvent.target))return;
+    const layer=menu.__reactFiber$focusFixture.memoizedProps;
+    const outside=new CustomEvent('dismissableLayer.pointerDownOutside',{cancelable:true,detail:{originalEvent}});
+    originalEvent.target.addEventListener(outside.type,event=>{
+      layer.onPointerDownOutside?.(event);layer.onInteractOutside?.(event);
+      if(!event.defaultPrevented)layer.onDismiss();
+    },{once:true});
+    originalEvent.target.dispatchEvent(outside);
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.key==='Escape'&&!event.isComposing&&event.keyCode!==229&&document.querySelector('#fixture-menu')){
+      event.preventDefault();closeMenu('escape',true);
+    }
+  },true);
+  window.fixturePause = false;
+  window.fixtureWaiters = [];
+  window.fetch = async (input,init) => {
+    const url = new URL(input instanceof Request?input.url:input,location.href);
+    if(url.pathname.startsWith('/backend-api/conversation/')) return new Response('{}');
+    if(url.pathname==='/backend-api/me') return new Response(JSON.stringify({id:'fixture-user'}));
+    if(url.pathname.endsWith('/reference-images')) {
+      window.fixtureCalls.pages++;
+      network();
+      if(window.fixturePause) await new Promise((resolve,reject)=>{
+        const signal=init?.signal;
+        const cleanup=()=>{
+          signal?.removeEventListener('abort',abort);
+          const index=window.fixtureWaiters.indexOf(done);
+          if(index>=0)window.fixtureWaiters.splice(index,1);
+        };
+        const done=()=>{cleanup();resolve()};
+        const abort=()=>{cleanup();window.fixtureCalls.aborted++;network();reject(new DOMException('Cancelled','AbortError'))};
+        window.fixtureWaiters.push(done);
+        signal?.addEventListener('abort',abort,{once:true});
+        if(signal?.aborted)abort();
+      });
+      const offset=Number(url.searchParams.get('cursor')||0), end=Math.min(offset+50,items.length);
+      return new Response(JSON.stringify({items:items.slice(offset,end),next_cursor:end<items.length?String(end):null}));
+    }
+    if(url.pathname.endsWith('/thumbnail_url')) {
+      window.fixtureCalls.lookups++;
+      const id=decodeURIComponent(url.pathname.split('/').at(-2)).split('~refimage_')[1];
+      if(new URL(location.href).searchParams.has('fail')&&[4,5].includes(Number(id)))return new Response('{}',{status:404});
+      const file=items[Number(id)].asset_pointer.slice('sediment://'.length);
+      return new Response(JSON.stringify({thumbnail_url:'https://images.oaiusercontent.com/'+file+'.png'}));
+    }
+    if(url.hostname==='images.oaiusercontent.com') {
+      window.fixtureCalls.images++;
+      network();
+      return new Response(await image,{headers:{'content-type':'image/png'}});
+    }
+    if(url.origin===location.origin || url.protocol==='blob:' || url.protocol==='data:') return localFetch(input,init);
+    throw new Error('Fixture blocks external network access');
+  };
+</script>
+<script src="../chatgpt-reference-menu.user.js"></script>
+<script>
+  window.fixturePause=new URL(location.href).searchParams.has('hold');
+  let selectionCount=0, hoverTimer;
+  window.fixtureFocus={capture:0,blur:0,outside:0,closed:0,lastClose:null,windowBlurListeners:0,keyboardCleanup:0};
+  // Radix Menu root effects, as in the live bundle: a keydown/pointer effect and a window blur effect that closes the menu.
+  // The userscript may release only the window blur effect's cleanup.
+  let menuEffects=null;
+  function mountMenuRoot(menu){
+    let open=true;
+    const onOpenChange=next=>{if(!next&&open)closeMenu('window-blur')};
+    const keyboard={tag:9,deps:[],create:()=>{const handleKeyDown=()=>{};document.addEventListener('keydown',handleKeyDown,{capture:true});return ()=>{window.fixtureFocus.keyboardCleanup++;document.removeEventListener('keydown',handleKeyDown,{capture:true})}}};
+    const blur={tag:9,deps:[open,onOpenChange],create:()=>{if(!open)return;const handleBlur=()=>onOpenChange(false);return window.addEventListener('blur',handleBlur),()=>window.removeEventListener('blur',handleBlur)}};
+    keyboard.next=blur;blur.next=keyboard;
+    for(const effect of [keyboard,blur])effect.inst={destroy:effect.create()};
+    const root={type:{name:'Menu'},memoizedProps:{open:true},updateQueue:{lastEffect:blur},return:owner};
+    const popper={memoizedProps:{},return:root};
+    const provider={memoizedProps:{open:true,onOpenChange,content:menu},return:popper};
+    menuEffects={effects:[keyboard,blur],close(){open=false;for(const effect of [keyboard,blur]){const destroy=effect.inst.destroy;effect.inst.destroy=undefined;destroy?.()}}};
+    return {memoizedProps:{onClose:()=>onOpenChange(false)},return:provider};
+  }
+  const menuBlurListeners=new Set(), nativeAddEventListener=window.addEventListener;
+  window.addEventListener=function(type,listener,options){
+    if(this===window&&type==='blur'&&String(listener).includes('onOpenChange')){menuBlurListeners.add(listener);window.fixtureFocus.windowBlurListeners=menuBlurListeners.size}
+    return nativeAddEventListener.call(this,type,listener,options);
+  };
+  const nativeRemoveEventListener=window.removeEventListener;
+  window.removeEventListener=function(type,listener,options){
+    if(this===window&&type==='blur'){menuBlurListeners.delete(listener);window.fixtureFocus.windowBlurListeners=menuBlurListeners.size}
+    return nativeRemoveEventListener.call(this,type,listener,options);
+  };
+  let closingMenu=null;
+  function closeMenu(reason,restoreFocus=false){
+    const menu=document.querySelector('#fixture-menu');if(!menu||closingMenu===menu)return;
+    // Removing the focused search field fires blur; that nested close must not run again.
+    closingMenu=menu;window.fixtureFocus.closed++;window.fixtureFocus.lastClose=reason;
+    try{menu.remove()}finally{closingMenu=null}
+    resetHoverProps(false);
+    const effects=menuEffects;menuEffects=null;effects?.close();
+    if(restoreFocus)document.querySelector('#open').focus({preventScroll:true});
+  }
+  const query={queryKey:['chatgpt-reference-images','fixture','fixture-menu'],state:{fetchStatus:'idle',data:[]},options:{},promise:null};
+  const choose=()=>{
+    window.fixtureCalls.selections=++selectionCount;
+    document.querySelector('#result').textContent='선택 '+selectionCount+'회';
+    closeMenu('selection');
+    return true;
+  };
+  const scope={get(){},query:{},queryClient:{getQueryCache:()=>({findAll:()=>[query]}),setQueryData:(key,data)=>{
+    query.state.data=typeof data==='function'?data(query.state.data):data;
+    const menu=document.querySelector('#fixture-menu'); if(menu) render(menu,query.state.data);
+  }}};
+  const owner={memoizedProps:{cacheKey:'fixture-menu',items:[],onRecreate:choose},updateQueue:{memoCache:{data:[[scope]]}}};
+  function render(menu,refs){
+    for(const row of menu.querySelectorAll('[role="menuitem"]'))row.remove();
+    for(const item of refs){
+      const row=document.createElement('div'); row.setAttribute('role','menuitem'); row.tabIndex=0;
+      row.__reactFiber$fixture={key:item.id,return:owner};
+      const icon=document.createElement('span'); icon.dataset.leadingIconSlot='menu';
+      row.append(icon,document.createTextNode(item.entity_name)); row.onclick=choose; menu.append(row);
+    }
+  }
+  async function load(menu){
+    await window.fetch(location.origin+'/backend-api/me',{headers:{Authorization:'Bearer local-fixture', 'ChatGPT-Account-ID':'fixture'}});
+    query.state.data=[];
+    let cursor=null;
+    do {
+      const url=new URL('/backend-api/files/library/reference-images',location.origin);
+      url.searchParams.set('limit','50'); if(cursor!==null) url.searchParams.set('cursor',cursor);
+      const body=await(await window.fetch(url.href,{headers:{'ChatGPT-Account-ID':'fixture'}})).json();
+      query.state.data.push(...body.items); render(menu,query.state.data);
+      cursor=body.next_cursor;
+    } while(cursor!==null && menu.isConnected);
+  }
+  document.querySelector('#theme').onclick=()=>{const dark=document.documentElement.classList.toggle('dark');document.querySelector('#theme').textContent=dark?'밝은 테마로 전환':'어두운 테마로 전환'};
+  const lifecycleQuery=location.search;
+  document.querySelector('#other-chat').onclick=()=>{closeMenu('route');history.pushState(null,'','/c/fixture-other'+lifecycleQuery)};
+  document.querySelector('#source-chat').onclick=()=>history.pushState(null,'','/c/fixture-cache'+lifecycleQuery);
+  document.querySelector('#delete-chat').onclick=()=>window.fetch(location.origin+'/backend-api/conversation/'+location.pathname.replace(/\/$/,'').split('/').pop(),{method:'PATCH',body:JSON.stringify({is_visible:false})});
+  window.fetch(location.origin+'/backend-api/me',{headers:{Authorization:'Bearer local-fixture','ChatGPT-Account-ID':'fixture'}});
+  document.querySelector('#open').onclick=()=>{
+    const old=document.querySelector('#fixture-menu'); if(old){closeMenu('toggle');return;}
+    const menu=document.createElement('div'); menu.id='fixture-menu'; menu.setAttribute('role','menu');
+    menu.tabIndex=-1;
+    let outsideInteraction=false;
+    menu.__reactProps$focusFixture=Object.freeze({
+      onBlurCapture:()=>window.fixtureFocus.capture++,
+      onBlur:event=>{window.fixtureFocus.blur++;if(!event.relatedTarget||!menu.contains(event.relatedTarget))closeMenu('blur',false)},
+    });
+    menu.__reactFiber$focusFixture={memoizedProps:{
+      onFocusOutside:undefined,onPointerDownOutside:undefined,
+      onInteractOutside:event=>{outsideInteraction=true;window.fixtureFocus.outside++;window.fixtureFocus.originalEventType=event.detail.originalEvent.type},
+      onDismiss:()=>closeMenu('outside',!outsideInteraction),
+    },return:mountMenuRoot(menu)};
+    document.querySelector('#host').append(menu);
+    resetHoverProps(true);
+    query.state.fetchStatus='fetching';
+    query.promise=load(menu).finally(()=>{query.state.fetchStatus='idle'});
+    setTimeout(()=>{if(menu.isConnected)menu.querySelector('.ref-fast-controls input')?.focus()},0);
+    return query.promise;
+  };
+  document.querySelector('#open').onpointerenter=()=>{hoverTimer=setTimeout(()=>document.querySelector('#open').click(),200)};
+  document.querySelector('#open').onpointerleave=()=>clearTimeout(hoverTimer);
+  document.querySelector('#close').onclick=()=>closeMenu('button');
+  document.querySelector('#change').onclick=()=>{items[12]={...items[12],entity_name:'R0012__갱신된-이름__기본'}};
+  document.querySelector('#pause').onclick=()=>{window.fixturePause=true};
+  document.querySelector('#resume').onclick=()=>{
+    window.fixturePause=false; for(const resolve of window.fixtureWaiters.splice(0))resolve();
+  };
+  // Composer @-mention suggestions shaped like live ChatGPT (checked 2026-11-12): sections
+  // <div data-mention-section-id> inside [data-mention-list-scroll-area], rows button[data-list-navigation-item]
+  // in [data-mention-section-items] with the React key `reference-image:<id>` two fibers up, and aria-current="true"
+  // on the highlighted row. An exact name match is shown in the "exact-matches" section instead of "reference-images".
+  window.fixtureMention={opened:0,inserted:[]};
+  const composer=document.querySelector('#composer');
+  let mentionIndex=-1;
+  const mentionRows=()=>[...document.querySelectorAll('#mention-list [data-list-navigation-item]')];
+  function highlightMention(index){
+    const rows=mentionRows();if(!rows.length)return;
+    mentionIndex=(index+rows.length)%rows.length;
+    rows.forEach((row,i)=>{if(i===mentionIndex)row.setAttribute('aria-current','true');else row.removeAttribute('aria-current')});
+    rows[mentionIndex].scrollIntoView({block:'nearest'});
+  }
+  // ChatGPT keeps @-suggestion icons in a 50-entry cache; with more icon rows mounted, each new icon evicts another
+  // and the evicted row re-creates its own, forever. Model that churn so the userscript's cover can be checked.
+  const APP_ICON_LIMIT=50;let iconChurn=null;window.fixtureMention.appIconSwaps=0;
+  const appIcon=(()=>{const c=document.createElement('canvas');c.width=c.height=48;const x=c.getContext('2d');x.fillStyle='#d33';x.fillRect(0,0,48,48);return c.toDataURL('image/png')})();
+  function setAppIcon(row,show){
+    const slot=row.querySelector('.app-icon');slot.replaceChildren();
+    if(show){const img=document.createElement('img');img.src=appIcon;img.style.cssText='width:20px;height:20px;border-radius:9999px;display:block';slot.append(img)}
+    else{const fallback=document.createElement('span');fallback.style.cssText='display:flex;width:100%;height:100%;align-items:center;justify-content:center';fallback.innerHTML='<svg width="14" height="14" viewBox="0 0 14 14"><rect width="14" height="14" fill="#999"/></svg>';slot.append(fallback)}
+  }
+  function startIconChurn(){
+    clearInterval(iconChurn);
+    const order=[];
+    mentionRows().forEach((row,i)=>{const show=i<APP_ICON_LIMIT;setAppIcon(row,show);if(show)order.push(row)});
+    iconChurn=setInterval(()=>{
+      const rows=mentionRows();if(!rows.length||rows.length<=APP_ICON_LIMIT)return;
+      const waiting=rows.find(row=>!row.querySelector('.app-icon img'));if(!waiting)return;
+      const evicted=order.shift();if(evicted){setAppIcon(evicted,false)}
+      setAppIcon(waiting,true);order.push(waiting);window.fixtureMention.appIconSwaps++;
+    },20);
+  }
+  // An inserted mention renders as a pill carrying ChatGPT's reference link; its icon also loses its cache entry to
+  // the churn and alternates between the image and the fallback glyph.
+  function insertPill(item){
+    const pill=document.createElement('span');pill.className='pill';pill.setAttribute('contenteditable','false');
+    const href='chatgpt-reference-image://'+encodeURIComponent(item.id)+'?assetPointer='+encodeURIComponent(item.asset_pointer);
+    pill.setAttribute('data-prompt-link-href',href);pill.setAttribute('data-prompt-link-label',item.entity_name);
+    const slot=document.createElement('span');slot.className='app-icon';
+    const label=document.createElement('span');label.textContent=item.entity_name.slice(0,12);
+    pill.append(slot,label);document.querySelector('#composer-pills').append(pill);
+    let shown=false;setAppIcon(pill,false);
+    pill.churn=setInterval(()=>{shown=!shown;setAppIcon(pill,shown);window.fixtureMention.pillIconSwaps=(window.fixtureMention.pillIconSwaps||0)+1},50);
+  }
+  function closeMentions(){clearInterval(iconChurn);document.querySelector('#mention-list')?.remove();mentionIndex=-1}
+  function mentionSection(id,list){
+    const section=document.createElement('div');section.dataset.mentionSectionId=id;
+    const rows=document.createElement('div');rows.dataset.mentionSectionItems='true';
+    for(const item of list){
+      const row=document.createElement('button');row.type='button';row.dataset.listNavigationItem='true';
+      const slot=document.createElement('span');slot.className='app-icon';
+      const label=document.createElement('span');label.className='label';label.textContent=item.entity_name;
+      row.append(slot,label);
+      // The row's icon component receives the image pointers, as ChatGPT's suggestion icon does.
+      const icon={key:null,memoizedProps:{assetPointer:item.asset_pointer,thumbnailAssetPointer:item.thumbnail_asset_pointer??null,useComposerThumbnailCache:true},child:null,sibling:null};
+      const keyed={key:'reference-image:'+item.id,memoizedProps:{},return:null};
+      row.__reactFiber$mention={key:null,child:{key:null,memoizedProps:{},child:icon,sibling:null},return:{key:null,return:keyed}};
+      row.onmousedown=event=>event.preventDefault();
+      row.onmousemove=()=>{const index=mentionRows().indexOf(row);if(index!==mentionIndex)highlightMention(index)};
+      row.onclick=()=>{window.fixtureMention.inserted.push(item.id);insertPill(item);closeMentions()};
+      rows.append(row);
+    }
+    section.append(rows);return section;
+  }
+  function openMentions(query){
+    closeMentions();
+    const list=document.createElement('div');list.id='mention-list';list.dataset.mentionListScrollArea='';
+    const words=query.toLowerCase(),exact=items.find(item=>item.entity_name.toLowerCase()===words);
+    list.append(exact?mentionSection('exact-matches',[exact]):
+      mentionSection('reference-images',items.filter(item=>item.entity_name.toLowerCase().includes(words)).slice(0,80)));
+    document.querySelector('#mention-host').append(list);
+    window.fixtureMention.opened++;startIconChurn();highlightMention(0);
+  }
+  composer.addEventListener('input',()=>{
+    const match=/@([^@\s]*)$/.exec(composer.value);
+    if(match)openMentions(match[1]);else closeMentions();
+  });
+  composer.addEventListener('keydown',event=>{
+    if(!document.querySelector('#mention-list'))return;
+    if(event.key==='ArrowDown'){event.preventDefault();highlightMention(mentionIndex+1)}
+    else if(event.key==='ArrowUp'){event.preventDefault();highlightMention(mentionIndex-1)}
+    else if(event.key==='Escape'){event.preventDefault();closeMentions()}
+    else if(event.key==='Enter'){event.preventDefault();mentionRows()[mentionIndex]?.click()}
+  });
+  composer.addEventListener('blur',()=>setTimeout(closeMentions,0));
+  document.querySelector('#inspect').onclick=()=>{
+    const search=document.querySelector('.ref-fast-controls input')?.value || 'R0012';
+    const reference=items.find(item=>item.entity_name.includes(search));
+    if(!reference)return;
+    const key=JSON.stringify([JSON.stringify(['AccountUserId_fixture','fixture']),reference.id,reference.asset_pointer,null]);
+    const request=indexedDB.open('chatgpt-reference-menu-fast-v1');
+    request.onsuccess=()=>{
+      const db=request.result,tx=db.transaction('previews','readonly'),record=tx.objectStore('previews').get(key);
+      const all=tx.objectStore('previews').getAll();
+      all.onsuccess=()=>{
+        const keys=new Set(items.map(item=>JSON.stringify([JSON.stringify(['AccountUserId_fixture','fixture']),item.id,item.asset_pointer,null])));
+        document.querySelector('#preview-total').textContent='큰 미리보기 저장 '+all.result.filter(item=>keys.has(item.key)&&item.processing).length+'/'+items.length;
+      };
+      tx.oncomplete=()=>db.close();
+      record.onsuccess=async()=>{
+        if(!record.result){document.querySelector('#preview-cache').textContent='저장 이미지 없음';return;}
+        const saved=record.result,bitmap=await createImageBitmap(saved.blob);
+        document.querySelector('#preview-cache').textContent='저장 이미지 '+bitmap.width+'×'+bitmap.height+' · '+saved.blob.type+' · '+saved.blob.size+'B · '+(saved.processing || 'original');
+        bitmap.close();
+      };
+    };
+  };
+</script>
+</html>
