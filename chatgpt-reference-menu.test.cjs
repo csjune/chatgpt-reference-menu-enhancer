@@ -2,8 +2,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const fs = require('node:fs');
-const { CONFIG, matchesSearch, contentKey, scopeKey, verifiedOwner, cleanReference, validThumbnail, fresh, catalogBody, detachedDownload, boundedImage,
-  thumbnailMatchesReference, referenceTransport, mergeReference, nativeSelection, DownloadQueue,
+const { CONFIG, matchesSearch, fileKey, pointerFileHex, contentKey, scopeKey, scopeOwner, verifiedOwner, cleanReference, validThumbnail, fresh, catalogBody, detachedDownload, boundedImage,
+  thumbnailMatchesReference, menuAvatarRequest, cleanRequestHeaders, referenceTransport, mergeReference, rowFiberInfo, isLibraryMenuItem, nativeSelection, DownloadQueue,
   ThumbnailInventory, SharedImages, PreviewLoader, ChatCacheSession, chatIdFor, deletedChatId, CHAT_CACHE_PREFIX, CHAT_CACHE_RECENT_KEY, CatalogSession, waitWithSignal, PreviewCache, PersistentPreviewCache, HoverPreview, resizePreview, previewImageSize, previewPosition,
   ReferenceIndex, AccessWriteBatch, MenuRows, ReferenceClickGate, ReferenceFocusGate, REFERENCE_HOVER_EVENTS, nativeCatalog,
   referenceButton, referenceStatus, referenceNotice, referenceRefreshState, UI_MESSAGES, resolveUiLocale, uiLocale, translateUi, UI_ICONS, glyphPosition, renderUiStatus,
@@ -987,6 +987,7 @@ test('메뉴 요청 취소와 백그라운드 다운로드의 취소를 분리�
 
 function mockDatabase(hooks = {}) {
   const stores = new Map();
+  const DELETED = Symbol('deleted');
   let schemaVersion = 0;
   const db = {
     close() {},
@@ -996,33 +997,98 @@ function mockDatabase(hooks = {}) {
     },
     transaction(name, mode) {
       const table = stores.get(name);
-      const writes = [];
-      const tx = { abort() {
-        tx.aborted = true;
-        tx.error = new DOMException('Aborted', 'AbortError');
-        queueMicrotask(() => tx.onabort?.());
-      }, objectStore: () => ({
-        get: key => {
-          const request = { result: table.get(key) };
-          queueMicrotask(() => { if (!tx.aborted) request.onsuccess?.(); });
-          return request;
-        },
-        getAll: () => {
-          const request = { result: [...table.values()] };
-          queueMicrotask(() => { if (!tx.aborted) request.onsuccess?.(); });
-          return request;
-        },
-        put: record => { writes.push(() => table.set(record.key, structuredClone(record))); return { result: record.key }; },
-        delete: key => { writes.push(() => table.delete(key)); return {}; },
-      }) };
-      queueMicrotask(async () => {
+      const staged = new Map();
+      let pending = 0;
+      let committing = false;
+      const readEntry = key => (staged.has(key) ? (staged.get(key) === DELETED ? undefined : staged.get(key)) : table.get(key));
+      const allEntries = () => {
+        const merged = new Map(table);
+        for (const [key, value] of staged) {
+          if (value === DELETED) merged.delete(key);
+          else merged.set(key, value);
+        }
+        return [...merged.values()];
+      };
+      const scheduleCommit = async () => {
+        if (committing || tx.aborted) return;
+        committing = true;
         try {
           await hooks.commit?.(name, mode);
           if (tx.aborted) return;
-          for (const write of writes) write();
+          for (const [key, value] of staged) {
+            if (value === DELETED) table.delete(key);
+            else table.set(key, value);
+          }
           tx.oncomplete?.();
+        } catch (error) {
+          tx.error = error;
+          tx.onerror?.();
         }
-        catch (error) { tx.error = error; tx.onerror?.(); }
+      };
+      const queueRequest = run => {
+        pending += 1;
+        const request = { result: undefined };
+        queueMicrotask(() => {
+          if (tx.aborted) { pending -= 1; return; }
+          try {
+            request.result = run();
+            request.onsuccess?.();
+          } catch (error) {
+            tx.aborted = true;
+            tx.error = error;
+            tx.onerror?.();
+          } finally {
+            pending -= 1;
+            if (pending === 0 && !tx.aborted) scheduleCommit();
+          }
+        });
+        return request;
+      };
+      const tx = {
+        abort() {
+          tx.aborted = true;
+          tx.error = new DOMException('Aborted', 'AbortError');
+          queueMicrotask(() => tx.onabort?.());
+        },
+        objectStore: () => ({
+          get: key => queueRequest(() => readEntry(key)),
+          getAll: () => queueRequest(() => allEntries()),
+          count: () => queueRequest(() => allEntries().length),
+          put: record => { staged.set(record.key, structuredClone(record)); return { result: record.key }; },
+          delete: key => { staged.set(key, DELETED); return {}; },
+          index: field => ({
+            openCursor: () => {
+              const request = { result: null };
+              const rows = allEntries().sort((a, b) => (a[field] ?? 0) - (b[field] ?? 0));
+              let index = 0;
+              const step = () => {
+                pending += 1;
+                queueMicrotask(() => {
+                  if (tx.aborted) { pending -= 1; return; }
+                  try {
+                    if (index < rows.length) {
+                      const value = rows[index++];
+                      request.result = { value, delete: () => { staged.set(value.key, DELETED); }, continue: () => step() };
+                    } else request.result = null;
+                    request.onsuccess?.();
+                  } catch (error) {
+                    tx.aborted = true;
+                    tx.error = error;
+                    tx.onerror?.();
+                  } finally {
+                    pending -= 1;
+                    if (pending === 0 && !tx.aborted) scheduleCommit();
+                  }
+                });
+              };
+              step();
+              return request;
+            },
+          }),
+        }),
+      };
+      queueMicrotask(() => {
+        if (pending === 0 && !tx.aborted) scheduleCommit();
       });
       return tx;
     },
@@ -1128,29 +1194,33 @@ async function until(predicate, message) {
 function cacheWorkerHarness({ pages, commit, request, lookup, visible = [], database, storageTimeoutMs, storageRetryMs, storageReopenMs,
   managed = false, chatStorage = stateStorage(), href = 'https://chatgpt.com/c/test', image, mutationStatus = 200,
   querySelectorAll = () => [] } = {}) {
-  const calls = { metadata: [], lookups: [], images: [] };
+  const calls = { metadata: [], lookups: [], images: [], requestHeaders: [] };
   const references = [...pages.values()].flatMap(page => page.items);
   const listeners = new Map();
   const { window, context } = loadRuntime({ managed, href, fetch: async (input, init) => {
     const url = new URL(input instanceof Request ? input.url : input);
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+    const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
+    calls.requestHeaders.push({ pathname: url.pathname, headers });
     if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
     if (url.pathname.startsWith('/backend-api/conversation/')) return new Response('{}', {status:mutationStatus});
     if (url.pathname.endsWith('/reference-images')) {
       const cursor = url.searchParams.get('cursor');
       calls.metadata.push(cursor);
-      if (request) return request(cursor, init?.signal);
+      if (request) return request(cursor, signal, headers);
       return new Response(JSON.stringify(pages.get(cursor)));
     }
     if (url.pathname.endsWith('/thumbnail_url')) {
       const id = decodeURIComponent(url.pathname.split('/').at(-2));
       calls.lookups.push(id);
-      if (lookup) return lookup(id, init?.signal);
+      if (lookup) return lookup(id, signal, headers);
       const item = references.find(item => item.id === id);
       return new Response(JSON.stringify({ thumbnail_url: 'https://chatgpt.com/backend-api/estuary/content?id=' + item.asset_pointer.slice('sediment://'.length) }));
     }
     if (url.pathname.endsWith('/estuary/content')) {
       calls.images.push(url.searchParams.get('id'));
-      if (image) return image(url.searchParams.get('id'), init?.signal);
+      if (image) return image(url.searchParams.get('id'), signal, headers);
       return new Response('valid-image', { headers: { 'Content-Type': 'image/png' } });
     }
     throw new Error('Unexpected test request');
@@ -1168,7 +1238,13 @@ function cacheWorkerHarness({ pages, commit, request, lookup, visible = [], data
     }, setTimeout: (fn, ms, ...args) => setTimeout(fn,
       storageTimeoutMs && ms === 5000 ? storageTimeoutMs : storageRetryMs && ms === 1000 ? storageRetryMs :
         storageReopenMs && ms >= CONFIG.storageReopenSeconds * 1000 ? storageReopenMs : ms, ...args),
-    window: context => ({ localStorage: chatStorage, addEventListener: (type, handler) => listeners.set(type, handler),
+    window: context => ({ localStorage: chatStorage,
+      addEventListener: (type, handler) => {
+        const set = listeners.get(type) || new Set();
+        set.add(handler);
+        listeners.set(type, set);
+      },
+      removeEventListener: (type, handler) => { listeners.get(type)?.delete(handler); },
       history: { pushState(data, unused, value) { context.location.href = new URL(value, context.location.href).href; },
         replaceState(data, unused, value) { context.location.href = new URL(value, context.location.href).href; } } }),
     expose: ['window.testSession = cacheSession;', `thumbnailLoader.visibleFiles = new Set(${JSON.stringify(visible)});`,
@@ -1177,7 +1253,7 @@ function cacheWorkerHarness({ pages, commit, request, lookup, visible = [], data
   return { window, calls, status: () => window.__referenceMenuFastStatus(),
     session: window.testSession, chatStorage, database: context.indexedDB,
     navigate: path => window.history.pushState(null, '', path),
-    event: (type, value = {}) => listeners.get(type)?.(value),
+    event: (type, value = {}) => { for (const fn of listeners.get(type) || []) fn(value); },
     login: () => window.fetch('https://chatgpt.com/backend-api/me', {headers:{ Authorization:'Bearer test-only', 'ChatGPT-Account-ID':'account' }}),
     cache: window.testCache,
     catalog: window.testCatalog, menus: window.testMenus, menuController: window.testMenuController,
@@ -2743,7 +2819,7 @@ test('같은 상태줄 모델은 다시 그리지 않아 진행 애니메이션�
     renderUiStatus(node, referenceStatus({ progress: { discovered: 3, ready: 2, failed: 0, pending: 1, total: 3, complete: false },
       pages: 1, caching: true }));
     assert.equal(renders, 3, 'a language change re-renders');
-  } finally { globalThis.document = previous; }
+  } finally { if (previous === undefined) delete globalThis.document; else globalThis.document = previous; }
 });
 
 test('대체된 큰 미리보기 작업(AbortError)은 마지막 시도에서도 실패가 아니라 대기로 남긴다', async () => {
@@ -3010,4 +3086,1954 @@ test('조회 실패 기록은 정해진 시간 동안만 다시 찾지 않게 �
   now += 59999; assert.equal(misses.has('a'), true);
   now += 1; assert.equal(misses.has('a'), false, 'retried after the lifetime');
   assert.equal(misses.has('b'), false);
+});
+
+// Lightweight DOM tree stub for integration tests exercising ReferenceMenuController and ComposerMentions.
+function createDomStub({ lang = 'en', hidden = true, selectors = () => [] } = {}) {
+  const docListeners = new Map();
+  class StubElement {
+    constructor(tag = 'div', text = '') {
+      this.tagName = tag.toUpperCase();
+      this.nodeType = 1;
+      this.children = [];
+      this.parentElement = null;
+      this.attributes = {};
+      this.dataset = {};
+      this.style = {};
+      this.className = '';
+      this.hidden = false;
+      this.isConnected = true;
+      this.listeners = new Map();
+      this._text = text;
+      this._rect = { top: 20, bottom: 50, left: 0, right: 200, width: 200, height: 30 };
+      this.offsetWidth = 0;
+      this.offsetHeight = 0;
+      this.clientLeft = 0;
+      this.clientTop = 0;
+      this.classList = {
+        _set: new Set(),
+        add: (...names) => { for (const n of names) this.classList._set.add(n); },
+        remove: (...names) => { for (const n of names) this.classList._set.delete(n); },
+        contains: name => this.classList._set.has(name),
+      };
+    }
+    get textContent() {
+      return this.children.length ? this.children.map(c => c.textContent ?? c.nodeValue ?? '').join('') : this._text;
+    }
+    set textContent(value) { this._text = String(value); this.children = []; }
+    append(...nodes) {
+      for (const n of nodes) {
+        if (n && typeof n === 'object') { n.parentElement = this; n.isConnected = this.isConnected; this.children.push(n); }
+        else this.children.push({ nodeType: 3, nodeValue: String(n), parentElement: this });
+      }
+    }
+    prepend(...nodes) {
+      const wrapped = nodes.map(n => {
+        if (n && typeof n === 'object') { n.parentElement = this; n.isConnected = this.isConnected; return n; }
+        return { nodeType: 3, nodeValue: String(n), parentElement: this };
+      });
+      this.children.unshift(...wrapped);
+    }
+    remove() {
+      if (!this.parentElement) return;
+      const idx = this.parentElement.children.indexOf(this);
+      if (idx >= 0) this.parentElement.children.splice(idx, 1);
+      this.parentElement = null;
+      this.isConnected = false;
+    }
+    setAttribute(name, value) {
+      this.attributes[name] = String(value);
+      if (name === 'id') this.id = String(value);
+    }
+    getAttribute(name) {
+      if (name === 'src' && this.src !== undefined) return this.src;
+      return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
+    }
+    hasAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name); }
+    removeAttribute(name) {
+      delete this.attributes[name];
+      if (name === 'src') delete this.src;
+    }
+    addEventListener(type, fn) {
+      const list = this.listeners.get(type) || [];
+      list.push(fn);
+      this.listeners.set(type, list);
+    }
+    dispatchEvent(event) {
+      for (const fn of this.listeners.get(event.type) || []) fn(event);
+    }
+    contains(node) {
+      if (!node) return false;
+      if (node === this) return true;
+      for (const c of this.children) if (c.nodeType === 1 && c.contains(node)) return true;
+      return false;
+    }
+    matches(selector) {
+      const s = selector.trim();
+      if (s.includes(',')) return s.split(',').some(part => this.matches(part));
+      if (s === '[role="menu"]') return this.getAttribute('role') === 'menu';
+      if (s === '[role="menuitem"]') return this.getAttribute('role') === 'menuitem';
+      if (s === '[data-leading-icon-slot="menu"]') return this.getAttribute('data-leading-icon-slot') === 'menu';
+      if (s === '[data-ref-fast-thumbnail]') return this.dataset.refFastThumbnail !== undefined;
+      if (s === '[data-ref-fast-mention-icon]') return this.dataset.refFastMentionIcon !== undefined;
+      if (s === 'img:not([data-ref-fast-thumbnail])') return this.tagName === 'IMG' && this.dataset.refFastThumbnail === undefined;
+      if (s === 'img:not([data-ref-fast-mention-icon])') return this.tagName === 'IMG' && this.dataset.refFastMentionIcon === undefined;
+      if (s === '[data-list-navigation-item]') return this.hasAttribute('data-list-navigation-item');
+      if (s === '[data-prompt-link-href]') return this.hasAttribute('data-prompt-link-href');
+      if (s === '[aria-selected="true"]') return this.getAttribute('aria-selected') === 'true';
+      if (s === '[aria-current="true"]') return this.getAttribute('aria-current') === 'true';
+      if (s === '[aria-selected="true"], [aria-current="true"]') return this.getAttribute('aria-selected') === 'true' || this.getAttribute('aria-current') === 'true';
+      if (/^[a-z0-9]+$/i.test(s)) return this.tagName === s.toUpperCase();
+      return false;
+    }
+    closest(selector) {
+      for (let node = this; node; node = node.parentElement) if (node.matches?.(selector)) return node;
+      return null;
+    }
+    querySelectorAll(selector) {
+      const results = [];
+      const walk = node => {
+        for (const c of node.children || []) {
+          if (c.nodeType === 1) {
+            if (c.matches(selector)) results.push(c);
+            walk(c);
+          }
+        }
+      };
+      walk(this);
+      return results;
+    }
+    querySelector(selector) { return this.querySelectorAll(selector)[0] || null; }
+    getBoundingClientRect() { return this._rect; }
+  }
+  const body = new StubElement('body');
+  const document = {
+    hidden,
+    documentElement: { lang },
+    body,
+    head: null,
+    createElement: tag => new StubElement(tag),
+    createTextNode: text => ({ nodeType: 3, nodeValue: String(text), parentElement: null }),
+    createTreeWalker(root) {
+      const queue = [];
+      const visit = node => {
+        for (const c of node.children || []) {
+          if (c.nodeType === 3) queue.push(c);
+          else visit(c);
+        }
+      };
+      visit(root);
+      let idx = 0;
+      return { nextNode: () => queue[idx++] || null };
+    },
+    addEventListener(type, fn) {
+      const set = docListeners.get(type) || new Set();
+      set.add(fn);
+      docListeners.set(type, set);
+    },
+    emit(type, event = {}) { for (const fn of docListeners.get(type) || []) fn(event); },
+    querySelectorAll: selector => selectors(selector),
+    querySelector: selector => selectors(selector)[0] || null,
+    getElementById: () => null,
+  };
+  return { StubElement, document, body, NodeFilter: { SHOW_TEXT: 4 },
+    getComputedStyle: () => ({ position: 'static', borderRadius: '' }) };
+}
+
+test('H1: ChatCacheSession 시작 실패 시 running 상태를 복구해 같은 채팅에서 다시 시도할 수 있다', async () => {
+  let starts = 0;
+  const session = new ChatCacheSession({
+    storage: stateStorage(),
+    start: async () => {
+      starts += 1;
+      if (starts === 1) throw new Error('Transient startup failure');
+    },
+    cancel: () => {},
+  });
+  session.route('https://chatgpt.com/c/chat-retry');
+  session.credentials({ key: 'k1', headers: { Authorization: 'Bearer a' } });
+  session.begin();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(starts, 1);
+  assert.equal(session.running, false);
+  assert.equal(session.controller, null);
+
+  session.begin();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(starts, 2);
+  assert.equal(session.running, true);
+
+  // Managed runtime integration: 500 on startup list allows retry on next open in the same chat.
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  let startupFails = 1;
+  const h = cacheWorkerHarness({
+    pages: new Map([[null, { items: [one], next_cursor: null }]]),
+    managed: true,
+    request: () => {
+      if (startupFails > 0) { startupFails -= 1; return new Response('{}', { status: 500 }); }
+      return new Response(JSON.stringify({ items: [one], next_cursor: null }));
+    },
+  });
+  await h.login();
+  await until(() => h.status().identityReady, 'identity unavailable');
+  h.catalog.refreshOnOpen();
+  await until(() => h.calls.metadata.length === 1 && !h.status().cacheChat.running, 'failed start left running stuck true');
+  h.catalog.refreshOnOpen();
+  await until(() => h.status().cacheChat.running && h.status().thumbnailProgress.complete, 'same-chat retry did not succeed');
+  assert.ok(h.calls.metadata.length >= 2);
+  h.cache.accessWrites.clear();
+});
+
+test('H2: 일시 헤더를 제거하고 401 응답은 무시하며 동일 계정 토큰 회전 시 스코프를 유지한다', async () => {
+  const dirty = new Headers({
+    Authorization: 'Bearer v1', 'ChatGPT-Account-ID': 'acc', 'X-Test': 'keep',
+    traceparent: '00-abc', tracestate: 's=1', baggage: 'b=1',
+    'x-request-id': 'req-1', 'cf-ray': 'ray-1', 'x-client-request-id': 'creq-1',
+    accept: 'text/event-stream', range: 'bytes=0-10',
+    'if-none-match': '"e"', 'if-modified-since': 'Mon', 'if-match': '"m"', 'if-range': '"r"', 'if-unmodified-since': 'Tue',
+    'content-type': 'application/json', 'content-length': '12', 'content-encoding': 'gzip',
+  });
+  const cleaned = cleanRequestHeaders(dirty);
+  assert.equal(cleaned.get('Authorization'), 'Bearer v1');
+  assert.equal(cleaned.get('ChatGPT-Account-ID'), 'acc');
+  assert.equal(cleaned.get('X-Test'), 'keep');
+  for (const dropped of ['traceparent', 'tracestate', 'baggage', 'x-request-id', 'cf-ray', 'x-client-request-id',
+    'accept', 'range', 'if-none-match', 'if-modified-since', 'if-match', 'if-range', 'if-unmodified-since',
+    'content-type', 'content-length', 'content-encoding']) {
+    assert.equal(cleaned.has(dropped), false, `header should be stripped: ${dropped}`);
+  }
+
+  const seenHeaders = [];
+  const transport = referenceTransport(async (req, reqInit) => {
+    const merged = new Headers(req.headers);
+    new Headers(reqInit?.headers).forEach((v, k) => merged.set(k, v));
+    seenHeaders.push(merged);
+    return new Response('{}');
+  }, 'https://chatgpt.com/backend-api/files/library/reference-images', { headers: dirty }, 'https://chatgpt.com');
+  await transport.list(null);
+  assert.equal(seenHeaders[0].get('Authorization'), 'Bearer v1');
+  assert.equal(seenHeaders[0].has('traceparent'), false);
+  transport.setAuthorization('Bearer v2');
+  await transport.verify('ref-1');
+  assert.equal(seenHeaders[1].get('Authorization'), 'Bearer v2');
+  assert.equal(seenHeaders[1].has('traceparent'), false);
+  assert.equal(seenHeaders[1].has('range'), false);
+  for (const [name, value] of seenHeaders[0]) {
+    if (name !== 'authorization') assert.equal(seenHeaders[1].get(name), value, `list header kept after rotation: ${name}`);
+  }
+
+  // Full fetch wrapper integration: 401 does not seed credentials; 200 rotation preserves scope and updates transport headers.
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  const two = { ...ref('two'), id: 'AccountUserId_user~refimage_two' };
+  let releaseFirstImage, releaseSlow;
+  const slowGate = new Promise(resolve => { releaseSlow = resolve; });
+  const firstImageGate = new Promise(resolve => { releaseFirstImage = resolve; });
+  const authSeen = [];
+  const signals = [];
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/c/test-h2',
+    fetch: async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      const headers = new Headers(input instanceof Request ? input.headers : undefined);
+      new Headers(init?.headers).forEach((v, k) => headers.set(k, v));
+      const signal = init?.signal || (input instanceof Request ? input.signal : undefined);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      if (url.pathname === '/backend-api/conversations') {
+        const auth = headers.get('Authorization');
+        if (auth === 'Bearer v2-slow') await slowGate;
+        return new Response('{}', { status: auth === 'Bearer invalid-401' ? 401 : 200 });
+      }
+      if (url.pathname.endsWith('/reference-images')) {
+        authSeen.push({ path: url.pathname, auth: headers.get('Authorization') });
+        return new Response(JSON.stringify({ items: [one, two], next_cursor: null }));
+      }
+      if (url.pathname.endsWith('/thumbnail_url')) {
+        authSeen.push({ path: url.pathname, auth: headers.get('Authorization') });
+        const id = decodeURIComponent(url.pathname.split('/').at(-2));
+        const item = [one, two].find(entry => entry.id === id);
+        return new Response(JSON.stringify({ thumbnail_url: 'https://chatgpt.com/backend-api/estuary/content?id=' + item.asset_pointer.slice('sediment://'.length) }));
+      }
+      if (url.pathname.endsWith('/estuary/content')) {
+        const id = url.searchParams.get('id');
+        authSeen.push({ path: url.pathname, id, auth: headers.get('Authorization') });
+        signals.push(signal);
+        if (id === 'file_one') await firstImageGate;
+        return new Response('valid-image', { headers: { 'Content-Type': 'image/png' } });
+      }
+      throw new Error(`Unexpected URL: ${url.pathname}`);
+    },
+    indexedDB: mockDatabase(),
+    Blob,
+    innerHeight: 1000,
+    document: {
+      createElement: () => ({
+        getContext: () => ({ drawImage() {} }),
+        toBlob: cb => cb(new Blob(['scaled'], { type: 'image/webp' })),
+        toDataURL: () => 'data:image/webp;base64,YWJj',
+      }),
+    },
+    createImageBitmap: async () => ({ width: 900, height: 1200, close() {} }),
+    window: context => ({
+      localStorage: stateStorage(),
+      history: { pushState() {}, replaceState() {} },
+    }),
+    expose: ['window.testCatalog = catalogController;', 'window.testCache = thumbnailCache;',
+      'window.testTransport = () => activeTransport;', 'window.testScope = () => activeScope;',
+      'window.testLoader = thumbnailLoader;'],
+  });
+
+  // Ensure sequential background downloads wait on file_one so token rotation catches it mid-flight.
+  const firstLookupSignalCount = () => authSeen.filter(entry => entry.path.endsWith('/estuary/content')).length;
+  // 401 before login must be ignored.
+  await window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer invalid-401', 'ChatGPT-Account-ID': 'account' },
+  });
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer v1', 'ChatGPT-Account-ID': 'account', traceparent: '00-ignore' },
+  });
+  await until(() => window.__referenceMenuFastStatus().identityReady, 'identity not ready');
+  window.testCatalog.refreshOnOpen();
+  await until(() => firstLookupSignalCount() >= 1, 'initial image download did not start');
+  const scopeBefore = window.testScope();
+  assert.ok(scopeBefore);
+
+  // 401 after login must also be ignored.
+  await window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer invalid-401', 'ChatGPT-Account-ID': 'account' },
+  });
+  assert.equal(window.testTransport().api ? true : false, true);
+
+  // Routine 200 OK token rotation on the same user and account updates activeTransport in place without aborting active work.
+  await window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer v2-rotated', 'ChatGPT-Account-ID': 'account', 'Accept': 'text/event-stream' },
+  });
+  assert.equal(window.testScope(), scopeBefore, 'activeScope must stay intact across same-account token rotation');
+  assert.equal(signals[0].aborted, false, 'in-flight download must not be aborted on token rotation');
+
+  releaseFirstImage();
+  await until(() => window.__referenceMenuFastStatus().thumbnailProgress.complete &&
+    window.__referenceMenuFastStatus().previewProgress.complete, 'downloads did not complete after token rotation');
+  // Next request after rotation must use Bearer v2-rotated.
+  await window.testTransport().api.verify(two.id);
+  const lastVerify = authSeen.filter(entry => entry.path.endsWith('/thumbnail_url')).at(-1);
+  assert.equal(lastVerify.auth, 'Bearer v2-rotated');
+
+  // Credentials follow request order: a slow request sent with an older token must not replace a newer one.
+  const slowRequest = window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer v2-slow', 'ChatGPT-Account-ID': 'account' },
+  });
+  await window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer v3', 'ChatGPT-Account-ID': 'account', 'X-Route-Hint': 'conversations' },
+  });
+  releaseSlow();
+  await slowRequest;
+  await window.testTransport().api.verify(two.id);
+  const afterSlow = authSeen.filter(entry => entry.path.endsWith('/thumbnail_url')).at(-1);
+  assert.equal(afterSlow.auth, 'Bearer v3');
+  window.testCache.accessWrites.clear();
+});
+
+test('시작 실패한 채팅 캐시는 앱 요청마다 다시 시작하지 않고 메뉴 열기·토큰 회전·다른 채팅·다른 계정에서만 다시 시도한다', async () => {
+  let starts = 0;
+  let shouldFail = true;
+  const session = new ChatCacheSession({
+    storage: stateStorage(),
+    start: async () => { starts++; if (shouldFail) throw new Error('Reference cache startup failed'); },
+    cancel: () => {},
+  });
+  const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+  session.route('https://chatgpt.com/c/chat-a');
+  session.begin();
+  session.credentials({ key: 'k1', authorization: 'Bearer expired', headers: new Headers() });
+  await flush();
+  assert.equal(starts, 1);
+  assert.equal(session.running, false);
+  for (let i = 0; i < 5; i++) {
+    session.credentials({ key: 'k1', authorization: 'Bearer expired', headers: new Headers() });
+    await flush();
+  }
+  assert.equal(starts, 1, 'app requests with the same failed token must not restart a failed start');
+  session.credentials({ key: 'k1', authorization: 'Bearer rotated', headers: new Headers() });
+  await flush();
+  assert.equal(starts, 2, 'rotating Authorization on the same account/chat must retry');
+  session.suspend();
+  session.begin();
+  await flush();
+  assert.equal(starts, 3, 'opening the menu retries');
+  session.route('https://chatgpt.com/c/chat-b');
+  await flush();
+  session.route('https://chatgpt.com/c/chat-a');
+  await flush();
+  assert.equal(starts, 4, 'returning from chat-b to chat-a via route() must retry without begin()');
+  session.credentials({ key: 'k2', authorization: 'Bearer k2', headers: new Headers() });
+  await flush();
+  assert.equal(starts, 5, 'another account retries');
+  session.credentials({ key: 'k1', authorization: 'Bearer rotated', headers: new Headers() });
+  await flush();
+  assert.equal(starts, 6, 'returning to k1 after k2 must retry without being blocked by prior failedStart');
+  shouldFail = false;
+  session.route('https://chatgpt.com/c/chat-b'); session.begin(); await flush();
+  assert.equal(starts, 7, 'successful start clears failedStart');
+  session.suspend();
+  session.resume();
+  await flush();
+  assert.equal(starts, 8, 'after a successful start, resuming on suspend/resume is not blocked');
+});
+
+test('다른 저장 작업에 밀린(superseded) 큰 미리보기는 닫지 않고 그 작업이 저장한 이미지를 보여준다', async () => {
+  const shown = [];
+  let gets = 0;
+  const preview = new HoverPreview({
+    cache: {
+      get: async () => (gets++ === 0 ? null : 'blob:stored'),
+      put: async () => { throw new DOMException('Preview superseded', 'AbortError'); },
+    },
+    load: async () => new Blob(['image'], { type: 'image/png' }),
+    current: () => true,
+    delay: 0,
+    show: state => shown.push(state.status + ':' + state.url),
+    hide: () => {},
+  });
+  preview.open('k', ref('one'), { row: {} });
+  await until(() => shown.includes('ready:blob:stored'), 'superseded preview was not shown');
+  assert.ok(preview.target, 'preview stays open');
+  preview.close();
+
+  // Production path: HoverPreview WITH resolve + real PersistentPreviewCache while a slower background store() is still resizing.
+  let releaseBg, bgPromise, bgStarted = false;
+  const bgGate = new Promise(resolve => { releaseBg = resolve; });
+  const h = diskPreviewHarness({
+    resize: async blob => {
+      const label = await blob.text();
+      if (label === 'fg') {
+        bgStarted = true;
+        bgPromise = h.cache.store(h.key('one'), new Blob(['bg'], { type: 'image/png' }));
+      } else if (label === 'bg') {
+        await bgGate;
+      }
+      return { blob, width: 100, height: 100 };
+    },
+  });
+  const realShown = [];
+  let realHides = 0;
+  const realPreview = new HoverPreview({
+    cache: h.cache,
+    load: async () => new Blob(['fg'], { type: 'image/png' }),
+    resolve: async (key, reference, signal) => {
+      const cached = await h.cache.get(key, signal);
+      if (cached) return cached;
+      return h.cache.put(key, new Blob(['fg'], { type: 'image/png' }), undefined, signal);
+    },
+    current: () => true,
+    delay: 0,
+    show: state => realShown.push(`${state.status}:${state.url}`),
+    hide: () => realHides++,
+  });
+  realPreview.open(h.key('one'), ref('one'), { row: {} });
+  await until(() => bgStarted, 'concurrent store() did not start');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(realHides, 1, 'superseded HoverPreview must wait on in-flight store() rather than closing immediately');
+  assert.ok(realPreview.target, 'preview target stays open while waiting for in-flight writer');
+  releaseBg();
+  await (await bgPromise).committed;
+  await until(() => realShown.some(entry => entry.startsWith('ready:blob:')),
+    'HoverPreview with resolve did not display stored image from slower concurrent store()');
+  assert.equal(realHides, 1);
+  realPreview.close();
+
+  // Read-only context (context.stored set) must not recover from hover cache on AbortError.
+  let roGets = 0;
+  const roPreview = new HoverPreview({
+    cache: { get: async () => { roGets++; return 'blob:unexpected'; } },
+    load: async () => new Blob(['fg'], { type: 'image/png' }),
+    resolve: async () => { throw new DOMException('Aborted', 'AbortError'); },
+    current: () => true,
+    delay: 0,
+    show: () => {},
+    hide: () => {},
+  });
+  roPreview.open('k', ref('one'), { row: {}, stored: 'blob:ro' });
+  await until(() => roPreview.target === null, 'read-only stored preview must close on AbortError');
+  assert.equal(roGets, 0, 'read-only context.stored must not call cache.get on AbortError');
+  h.cache.clear();
+});
+
+test('H3: 10개 지원 로케일 참조 버튼을 모두 인식하고 lastButton 없이도 React fiber로 메뉴를 마운트한다', async () => {
+  const supported = [
+    ['사용된 참고 자료 1개 보기', '참고 자료 2개 보기', '참고 이미지 추가'],
+    ['Show the 1 reference used', 'View 2 references', 'Add reference image'],
+    ['使用した参照画像を表示', '利用中の参照資料2件を見る', '参照画像を追加'],
+    ['显示所用的 1 张参考图', '查看 2 张参考图', '添加参考图'],
+    ['顯示所用的 1 張參考圖片', '檢視 2 張參考圖', '新增參考圖片'],
+    ['Mostrar una referencia utilizada', 'Ver 2 referencias', 'Añadir imagen de referencia'],
+    ['Afficher une référence utilisée', 'Voir 2 références', 'Ajouter une image de référence'],
+    ['Verwendete Referenz anzeigen', 'Die 2 verwendeten Referenzen anzeigen (2)', 'Referenzbild hinzufügen'],
+    ['Mostrar uma referência usada', 'Ver 2 referências', 'Adicionar imagem de referência'],
+    ['Показать 1 референс', 'Посмотреть 2 референса', 'Добавить референс'],
+  ];
+  for (const [singular, plural, addLabel] of supported) {
+    for (const label of [singular, plural]) {
+      const btn = { getAttribute: () => label };
+      assert.equal(referenceButton({ closest: () => btn }), btn, `should match: ${label}`);
+    }
+    const addBtn = { getAttribute: () => addLabel };
+    assert.equal(referenceButton({ closest: () => addBtn }), null, `should exclude add button: ${addLabel}`);
+  }
+  for (const label of ['Show the reference used', 'Show the 2 references used', 'Mostrar 1 referencia usada',
+    'Mostrar la referencia utilizada', 'Mostrar las 2 referencias utilizadas', 'Mostrar 1 referência usada',
+    'Afficher la référence utilisée', 'Afficher les 2 références utilisées', 'Die verwendete Referenz anzeigen',
+    'Die 2 verwendeten Referenzen anzeigen', '2 Referenzen anzeigen', 'Показать 1 использованный референс']) {
+    const btn = { getAttribute: () => label };
+    assert.equal(referenceButton({ closest: () => btn }), btn, `should match official form: ${label}`);
+  }
+  for (const label of ['Preview references', 'Review references', 'Remove the reference used', 'Hide references used',
+    'Delete 2 references used', '사용된 참고 자료 삭제', '참고 이미지 보관함 열기', 'Show references in library',
+    'Mostrar referencias', 'Mostrar referências', 'Afficher les références', 'Referenzen anzeigen', 'Показать референсы',
+    '使用した参照画像を削除', 'Referenzbilder in der Bibliothek anzeigen', 'Показать библиотеку референсов']) {
+    const btn = { getAttribute: () => label };
+    assert.equal(referenceButton({ closest: () => btn }), null, `should not match: ${label}`);
+  }
+
+  // Fiber-based menu detection without lastButton.
+  const dom = createDomStub();
+  const providerFiber = { memoizedProps: { cacheKey: 'account', items: [], onRecreate() {} }, return: null };
+  const rowNode = new dom.StubElement('div');
+  rowNode.setAttribute('role', 'menuitem');
+  rowNode.append('one');
+  rowNode.__reactFiber$test = { key: 'AccountUserId_user~refimage_one', return: providerFiber };
+  const menuNode = new dom.StubElement('div');
+  menuNode.setAttribute('role', 'menu');
+  menuNode.append(rowNode);
+  // A menu under the same reference provider without reference rows (for example the image's own actions) stays native,
+  // even when a catalog reference shares its row label ("Share").
+  const actionRow = new dom.StubElement('div');
+  actionRow.setAttribute('role', 'menuitem');
+  actionRow.append('Share');
+  actionRow.__reactFiber$test = { key: 'share', return: providerFiber };
+  const actionMenu = new dom.StubElement('div');
+  actionMenu.setAttribute('role', 'menu');
+  actionMenu.append(actionRow);
+
+  assert.equal(rowFiberInfo(rowNode).referenceId, 'AccountUserId_user~refimage_one');
+  assert.equal(isLibraryMenuItem(rowNode), true);
+
+  let requestedCatalog = 0;
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  const shareRef = { ...ref('share'), id: 'AccountUserId_user~refimage_share', entity_name: 'Share' };
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/c/fiber-menu',
+    document: { ...dom.document, querySelectorAll: s => (s === '[role="menu"]' ? [actionMenu, menuNode] : []) },
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    getComputedStyle: dom.getComputedStyle,
+    fetch: async input => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      if (url.pathname.endsWith('/reference-images')) {
+        requestedCatalog += 1;
+        return new Response(JSON.stringify({ items: [one, shareRef], next_cursor: null }));
+      }
+      if (url.pathname.endsWith('/thumbnail_url')) {
+        const id = decodeURIComponent(url.pathname.split('/').at(-2));
+        const fileId = id.endsWith('share') ? 'file_share' : 'file_one';
+        return new Response(JSON.stringify({ thumbnail_url: `https://chatgpt.com/backend-api/estuary/content?id=${fileId}` }));
+      }
+      if (url.pathname.endsWith('/estuary/content')) return new Response('valid-image', { headers: { 'Content-Type': 'image/png' } });
+      throw new Error(`Unexpected ${url.pathname}`);
+    },
+    indexedDB: mockDatabase(),
+    Blob,
+    innerWidth: 1280,
+    innerHeight: 1000,
+    createImageBitmap: async () => ({ width: 48, height: 48, close() {} }),
+    window: () => ({
+      localStorage: stateStorage(),
+      history: { pushState() {}, replaceState() {} },
+    }),
+    expose: ['window.testMenuController = menuController;', 'window.testCache = thumbnailCache;'],
+  });
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer test', 'ChatGPT-Account-ID': 'account' },
+  });
+  window.testMenuController.updateMenus();
+  assert.equal(window.__referenceMenuFastStatus().menuCount, 1, 'menu must mount via React fiber without lastButton');
+  assert.ok(menuNode.querySelectorAll('div').length >= 1, 'search controls mounted onto menu');
+  await until(() => requestedCatalog >= 1 && window.__referenceMenuFastStatus().cacheChat.running,
+    'uncontrolled fiber menu must trigger refreshOnOpen');
+  // Re-run updateMenus after catalog indexing ("Share" is now in referenceIndex): actionMenu with React fiber must remain untouched.
+  window.testMenuController.updateMenus();
+  assert.equal(window.__referenceMenuFastStatus().menuCount, 1, 'React menu with Share row must not be mounted by name fallback');
+  assert.equal(actionMenu.querySelectorAll('input').length, 0);
+  window.testCache.accessWrites.clear();
+});
+
+test('M1: 썸네일 503 일시 실패 시 재시도 전에 대기 중인 원본 요청을 완료하지 않고 최종 결과로 완료한다', async () => {
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  let attempt = 0;
+  let releaseSecond;
+  const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+  const h = cacheWorkerHarness({
+    pages: new Map([[null, { items: [one], next_cursor: null }]]),
+    visible: ['file_one'],
+    image: async () => {
+      attempt += 1;
+      if (attempt === 1) return new Response('temporary-error', { status: 503 });
+      await secondGate;
+      return new Response('valid-image', { headers: { 'Content-Type': 'image/png' } });
+    },
+  });
+  await h.login();
+  await h.open();
+  await until(() => attempt === 1 && h.status().scopeReady, 'first thumbnail attempt did not run');
+
+  // Attach a mounted menu row matching file_one while the retry is pending.
+  const dom = createDomStub();
+  const row = new dom.StubElement('div');
+  const menu = new dom.StubElement('div');
+  menu.append(row);
+  h.menus.set(menu, {
+    menu, rows: [row], filteredRows: [row],
+    references: new Map([[row, one]]),
+    rowsByFile: new Map([['file_one', new Set([row])]]),
+    status: {}, matched: 1,
+  });
+
+  // Trigger a second failure-recovery cycle via direct waitForMenuImage while queueThumbnail runs.
+  let settledBeforeRetry = false;
+  const waitingPromise = h.window.fetch('https://chatgpt.com/backend-api/estuary/content?id=file_one').then(res => {
+    settledBeforeRetry = true;
+    return res;
+  });
+  // Allow first 503 retryPause (~300ms) partially, verifying native request wasn't settled with 503.
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(settledBeforeRetry, false, '503 on first attempt must not settle waiting native request prematurely');
+  releaseSecond();
+  const nativeResponse = await waitingPromise;
+  assert.equal(nativeResponse.status, 200);
+  assert.equal(await nativeResponse.text(), 'valid-image');
+
+  // Also test terminal 404 settles instead of hanging.
+  const two = { ...ref('two'), id: 'AccountUserId_user~refimage_two' };
+  const h404 = cacheWorkerHarness({
+    pages: new Map([[null, { items: [two], next_cursor: null }]]),
+    visible: ['file_two'],
+    image: () => new Response('missing', { status: 404 }),
+  });
+  const row2 = new dom.StubElement('div');
+  const menu2 = new dom.StubElement('div');
+  menu2.append(row2);
+  await h404.login();
+  await h404.open();
+  h404.menus.set(menu2, {
+    menu: menu2, rows: [row2], filteredRows: [row2],
+    references: new Map([[row2, two]]),
+    rowsByFile: new Map([['file_two', new Set([row2])]]),
+    status: {}, matched: 1,
+  });
+  const failedRes = await h404.window.fetch('https://chatgpt.com/backend-api/estuary/content?id=file_two');
+  assert.equal(failedRes.status, 404);
+  h.cache.accessWrites.clear();
+  h404.cache.accessWrites.clear();
+});
+
+test('M2: 비캐싱 화면의 참조 메뉴는 읽기 전용 상태줄·저장 썸네일·저장 큰 미리보기를 표시한다', async () => {
+  const dom = createDomStub({ hidden: true });
+  const items = ['one', 'two'].map(name => ({ ...ref(name), id: `AccountUserId_user~refimage_${name}` }));
+  const makeRow = name => {
+    const row = new dom.StubElement('div');
+    row.setAttribute('role', 'menuitem');
+    const slot = new dom.StubElement('span');
+    slot.setAttribute('data-leading-icon-slot', 'menu');
+    row.append(slot, name);
+    return row;
+  };
+  const row1 = makeRow('one');
+  const row2 = makeRow('two');
+  const menu = new dom.StubElement('div');
+  menu.setAttribute('role', 'menu');
+  menu.append(row1, row2);
+
+  const database = mockDatabase();
+  const calls = { metadata: 0, lookups: 0, images: 0 };
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/space/file/libfile_x',
+    document: {
+      ...dom.document,
+      querySelectorAll: selector => (selector === '[role="menu"]' ? [menu] : []),
+    },
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    getComputedStyle: dom.getComputedStyle,
+    innerWidth: 1280,
+    innerHeight: 1000,
+    fetch: async input => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      if (url.pathname.endsWith('/reference-images')) { calls.metadata++; return new Response(JSON.stringify({ items, next_cursor: null })); }
+      if (url.pathname.endsWith('/thumbnail_url')) { calls.lookups++; return new Response('{}', { status: 500 }); }
+      if (url.pathname.endsWith('/estuary/content')) { calls.images++; return new Response('', { status: 500 }); }
+      throw new Error(`Unexpected ${url.pathname}`);
+    },
+    indexedDB: database,
+    Blob,
+    window: () => ({
+      localStorage: stateStorage(),
+      history: { pushState() {}, replaceState() {} },
+    }),
+    expose: ['window.testMenuController = menuController;', 'window.testMenus = mountedMenus;', 'window.testCache = thumbnailCache;'],
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const scope = seedCatalog(database, items, { account: 'account', identity: 'initial-user', ageMinutes: 60 });
+  const thumbKey = JSON.stringify([scope, 'file_one']);
+  const thumbDataUrl = 'data:image/webp;base64,cmVhZG9ubHk=';
+  database.stores.get('thumbnails').set(thumbKey, {
+    key: thumbKey, savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000, dataUrl: thumbDataUrl,
+  });
+  const prevKey = JSON.stringify([scope, items[0].id, items[0].asset_pointer, items[0].thumbnail_asset_pointer]);
+  database.stores.get('previews').set(prevKey, {
+    key: prevKey, scope, savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000,
+    blob: new Blob(['stored-preview'], { type: 'image/webp' }),
+  });
+
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer test', 'ChatGPT-Account-ID': 'account' },
+  });
+  await until(() => window.__referenceMenuFastStatus().identityReady, 'identity not ready');
+  await window.fetch('https://chatgpt.com/backend-api/files/library/reference-images?limit=50', {
+    headers: { 'ChatGPT-Account-ID': 'account' },
+  });
+  assert.equal(window.__referenceMenuFastStatus().storedCatalogServes, 1);
+
+  window.testMenuController.updateMenus();
+  const state = window.testMenus.get(menu);
+  assert.ok(state, 'read-only menu must mount controls');
+  const statusText = state.status.textContent;
+  assert.match(statusText, /☷ 2/);
+  assert.doesNotMatch(statusText, /0 \/ \?/);
+  assert.doesNotMatch(statusText, /…/);
+
+  await until(() => row1.querySelector('[data-ref-fast-thumbnail]')?.src === thumbDataUrl,
+    'read-only row did not receive stored thumbnail');
+  assert.equal(calls.images, 0);
+  assert.equal(calls.lookups, 0);
+  assert.equal(window.testCache.accessWrites.pending.size, 0, 'read-only paint must not enqueue accessWrites');
+
+  window.testMenuController.previewRow(state, row1);
+  await until(() => window.testMenuController.previewPanel && !window.testMenuController.previewPanel.box.hidden &&
+    /^blob:/.test(window.testMenuController.previewPanel.image.src || ''),
+    'read-only hover preview did not open from disk');
+  assert.equal(calls.images, 0);
+  assert.equal(window.testCache.accessWrites.pending.size, 0);
+});
+
+test('M3: 동명 참조는 React fiber ID로 구분하고 편집 항목·높이 0 숨김 행을 제외한다', () => {
+  const index = new ReferenceIndex();
+  const a = { ...ref('a'), id: 'AccountUserId_user~refimage_a', entity_name: 'dup.png', asset_pointer: 'sediment://file_a' };
+  const b = { ...ref('b'), id: 'AccountUserId_user~refimage_b', entity_name: 'dup.png', asset_pointer: 'sediment://file_b' };
+  index.apply([a, b], true);
+
+  const ids = new Map();
+  const rows = new MenuRows(index, row => [row.label], row => ids.get(row) || null);
+  const state = { menu: { getBoundingClientRect: () => ({ top: 0, bottom: 300 }) } };
+  rows.init(state);
+
+  const mkRow = (label, id, rect) => {
+    const r = {
+      label, isConnected: true, hidden: false,
+      classList: { add() {} }, getAttribute: () => label,
+      getBoundingClientRect: () => rect,
+    };
+    if (id) ids.set(r, id);
+    return r;
+  };
+  const zeroBefore = mkRow('dup.png', a.id, { top: 0, bottom: 0, height: 0 });
+  const vis1 = mkRow('dup.png', a.id, { top: 20, bottom: 50, height: 30 });
+  const zeroMid = mkRow('dup.png', b.id, { top: 0, bottom: 0, height: 0 });
+  const vis2 = mkRow('dup.png', b.id, { top: 60, bottom: 90, height: 30 });
+  const below = mkRow('below', null, { top: 1200, bottom: 1230, height: 30 });
+
+  rows.sync(state, [zeroBefore, vis1, zeroMid, vis2, below]);
+  rows.filter(state, '');
+  assert.equal(state.references.get(vis1), a);
+  assert.equal(state.references.get(vis2), b);
+  assert.ok(state.rowsByFile.get('file_a')?.has(vis1));
+  assert.ok(state.rowsByFile.get('file_b')?.has(vis2));
+  assert.deepEqual(rows.visible(state, 1000), [vis1, vis2], 'zero-rect rows must be skipped cleanly');
+
+  // isLibraryMenuItem: plain mock without React fiber passes; used-reference edit item and non-library item are excluded.
+  assert.equal(isLibraryMenuItem({}), true);
+  const provider = {
+    memoizedProps: {
+      cacheKey: 'account',
+      items: [{ reference_image_id: 'AccountUserId_user~refimage_used' }],
+      onRecreate() {},
+    },
+    return: null,
+  };
+  assert.equal(isLibraryMenuItem({ __reactFiber$x: { key: 'AccountUserId_user~refimage_lib', return: provider } }), true);
+  assert.equal(isLibraryMenuItem({ __reactFiber$x: { key: 'AccountUserId_user~refimage_used', return: provider } }), false);
+  assert.equal(isLibraryMenuItem({ __reactFiber$x: { key: 'other-menu-item', return: provider } }), false);
+});
+
+test('M4: AccessWriteBatch의 flush·clear 동시 호출과 PersistentPreviewCache.clear·HoverPreview AbortError를 정리한다', async () => {
+  const writes = [];
+  let releaseFirst;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  let call = 0;
+  const batch = new AccessWriteBatch(async entries => {
+    call += 1;
+    writes.push(new Map(entries));
+    if (call === 1) await firstGate;
+  }, { delay: 5000, size: 100, interval: 60000 });
+
+  batch.touch('k1', 100000);
+  const firstFlush = batch.flush();
+  batch.clear();
+  assert.equal(batch.pending.size, 0);
+  assert.equal(batch.written.size, 0);
+  releaseFirst();
+  await firstFlush;
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].get('k1'), 100000, 'snapshotted batch must still finish writing');
+  assert.equal(batch.written.size, 0, 'cleared generation must not repopulate written map');
+
+  // Chained second flush waits for active flush.
+  writes.length = 0;
+  call = 0;
+  let releaseSecond;
+  const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+  batch.write = async entries => {
+    call += 1;
+    writes.push(new Map(entries));
+    if (call === 1) await secondGate;
+  };
+  batch.touch('a', 200000);
+  const p1 = batch.flush();
+  await Promise.resolve();
+  assert.equal(writes.length, 1);
+  batch.touch('b', 300000);
+  const p2 = batch.flush();
+  await Promise.resolve();
+  assert.equal(writes.length, 1, 'second flush must wait until first finishes');
+  releaseSecond();
+  await Promise.all([p1, p2]);
+  assert.equal(writes.length, 2);
+  assert.equal(writes[1].get('b'), 300000);
+  batch.clear();
+
+  // PersistentPreviewCache.clear() clears accessWrites.
+  const database = mockDatabase();
+  const pCache = new PersistentPreviewCache({
+    get: async () => null,
+    put: async () => {},
+    delete: async () => {},
+    request: async () => [],
+  }, { scope: () => 'scope-a' });
+  pCache.accessWrites.touch('p1', 100000);
+  pCache.clear();
+  assert.equal(pCache.accessWrites.pending.size, 0);
+  assert.equal(pCache.accessWrites.written.size, 0);
+
+  // HoverPreview AbortError closes preview and invokes hide().
+  let hiddenCount = 0;
+  const hp = new HoverPreview({
+    load: async () => { throw new DOMException('Aborted', 'AbortError'); },
+    show: () => {},
+    hide: () => { hiddenCount += 1; },
+    current: () => true,
+    delay: 0,
+  });
+  hp.open('k', ref('one'), { row: {} });
+  await until(() => hp.target === null, 'HoverPreview did not close after AbortError');
+  assert.ok(hiddenCount >= 2);
+});
+
+test('M5: saveThumbnail은 대소문자 무관 Content-Type을 허용하고 validThumbnail 불합격 데이터는 저장하지 않는다', async () => {
+  const database = mockDatabase();
+  let returnOversized = false;
+  const { window } = loadRuntime({
+    fetch: async () => new Response('{}'),
+    indexedDB: database,
+    Blob,
+    innerHeight: 1000,
+    document: {
+      createElement: () => ({
+        getContext: () => ({ drawImage() {} }),
+        toDataURL: () => (returnOversized ? 'data:image/png;base64,' + 'A'.repeat(33000) : 'data:image/webp;base64,YWJj'),
+      }),
+    },
+    createImageBitmap: async () => ({ width: 96, height: 96, close() {} }),
+    window: () => ({ localStorage: stateStorage() }),
+    expose: ['window.testCache = thumbnailCache;', 'window.testSetScope = s => { activeScope = s; };'],
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  window.testSetScope('scope-m5');
+  await window.testCache.saveThumbnail('scope-m5', 'file_mixed',
+    new Response('img', { status: 200, headers: { 'Content-Type': 'Image/PNG' } }));
+  assert.equal(database.stores.get('thumbnails').size, 1, 'mixed-case image MIME must be saved');
+
+  returnOversized = true;
+  await window.testCache.saveThumbnail('scope-m5', 'file_big',
+    new Response('img', { status: 200, headers: { 'Content-Type': 'image/png' } }));
+  assert.equal(database.stores.get('thumbnails').size, 1, 'oversized dataUrl must be rejected before IndexedDB write');
+  window.testCache.accessWrites.clear();
+});
+
+test('M6: 확장 빌드 스크립트는 CRLF, 메타데이터 오류, gecko_android 142, $ 이스케이프, 중첩 파일, 결정적 ZIP을 처리한다', async () => {
+  const mod = await import('./scripts/build-extension.mjs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const validSource = fs.readFileSync(require.resolve('./chatgpt-reference-menu.user.js'), 'utf8');
+  const crlfSource = validSource.replace(/\n/g, '\r\n');
+  assert.equal(validSource.includes('@name:en'), false);
+  assert.equal(validSource.includes('@description:en'), false);
+  const meta = mod.readMetadata(crlfSource);
+  assert.equal(meta.version, '1.0.1');
+  assert.equal(meta.messages.en.name, 'ChatGPT Reference Menu Enhancer');
+  assert.equal(meta.messages.ko.name, 'ChatGPT 참고 이미지 메뉴 가속');
+  assert.ok(meta.matches.includes('https://chatgpt.com/*'));
+
+  for (const [label, broken] of [
+    ['leading zero version', validSource.replace(/\/\/ @version\s+\S+/, '// @version            01.0.0')],
+    ['version mismatch', validSource.replace(/\bversion:\s*'[^']+'/, "version: '9.9.9'")],
+    ['empty name', validSource.replace(/\/\/ @name\s+.*/, '// @name')],
+    ['bad grant', validSource.replace(/\/\/ @grant\s+none/, '// @grant              GM_xmlhttpRequest')],
+    ['bad run-at', validSource.replace(/\/\/ @run-at\s+document-start/, '// @run-at             document-end')],
+    ['bad sandbox', validSource.replace(/\/\/ @sandbox\s+raw/, '// @sandbox            JavaScript')],
+    ['missing noframes', validSource.replace(/\/\/ @noframes\r?\n/, '')],
+    ['missing match', validSource.replace(/\/\/ @match\s+https:\/\/chatgpt\.com\/\*\r?\n/, '')],
+    ['bad match', validSource.replace(/\/\/ @match\s+https:\/\/chatgpt\.com\/\*/, '// @match              http://chatgpt.com/*')],
+  ]) {
+    assert.notEqual(broken, validSource, `test fixture did not mutate ${label}`);
+    assert.throws(() => mod.readMetadata(broken), `expected failure for ${label}`);
+  }
+
+  const manifest = mod.buildManifest(meta);
+  assert.equal(manifest.browser_specific_settings.gecko.strict_min_version, '140.0');
+  assert.equal(manifest.browser_specific_settings.gecko_android.strict_min_version, '142.0');
+
+  assert.equal(mod.escapeMessage('Cost $1 and $NAME'), 'Cost $$1 and $$NAME');
+  assert.deepEqual(mod.parseCliArgs(['--out', 'custom-out']), { out: path.resolve('custom-out') });
+  assert.deepEqual(mod.parseCliArgs(['--out=custom-out']), { out: path.resolve('custom-out') });
+  assert.throws(() => mod.parseCliArgs(['--out']));
+  assert.throws(() => mod.parseCliArgs(['--bogus']));
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ref-ext-test-'));
+  try {
+    const crlfUserscript = path.join(tmpDir, 'crlf.user.js');
+    const sourceWithDollar = validSource.replace(/\/\/ @description\s+/, '// @description        Save $1 ');
+    assert.notEqual(sourceWithDollar, validSource, 'description replacement did not match');
+    fs.writeFileSync(crlfUserscript, sourceWithDollar.replace(/\n/g, '\r\n'), 'utf8');
+    const outDir = path.join(tmpDir, 'dist');
+    fs.mkdirSync(outDir, { recursive: true });
+    const staleZip = path.join(outDir, 'chatgpt-reference-menu-enhancer-0.9.0-firefox.zip');
+    fs.writeFileSync(staleZip, 'stale');
+
+    const first = mod.packageExtension({ out: outDir, userscriptPath: crlfUserscript });
+    assert.equal(fs.existsSync(staleZip), false, 'stale zip must be deleted');
+    const enMessages = JSON.parse(fs.readFileSync(path.join(first.unpacked, '_locales/en/messages.json'), 'utf8'));
+    assert.match(enMessages.extDescription.message, /\$\$1/);
+    const copiedScript = fs.readFileSync(path.join(first.unpacked, 'reference-menu.js'), 'utf8');
+    assert.equal(copiedScript.includes('\r'), false, 'reference-menu.js must be normalized to LF');
+
+    const extraDir = path.join(tmpDir, 'extra-ext');
+    mod.buildExtension(extraDir, { userscriptPath: crlfUserscript, extraFiles: { 'nested/dir/init.js': 'console.log(1);' } });
+    assert.equal(fs.readFileSync(path.join(extraDir, 'nested/dir/init.js'), 'utf8'), 'console.log(1);');
+
+    const zipBytes1 = fs.readFileSync(first.zip);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const second = mod.packageExtension({ out: outDir, userscriptPath: crlfUserscript });
+    const zipBytes2 = fs.readFileSync(second.zip);
+    assert.equal(Buffer.compare(zipBytes1, zipBytes2), 0, 'ZIP build must be byte-identical across runs');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('L1/L2 및 미테스트 경로: @ 아이콘 스케일 보정·새 채팅 미리보기·window.module 공존·가시성 타이머·캐시 정리', async () => {
+  // 1. ComposerMentions scale compensation + stored large preview + window.module coexistence.
+  const dom = createDomStub({ hidden: true });
+  const row = new dom.StubElement('button');
+  row.setAttribute('data-list-navigation-item', '');
+  row.setAttribute('aria-current', 'true');
+  row.offsetWidth = 20;
+  row.offsetHeight = 20;
+  row._rect = { left: 100, top: 200, right: 110, bottom: 210, width: 10, height: 10 }; // CSS transform: scale(0.5)
+  const slot = new dom.StubElement('span');
+  slot._rect = { left: 102, top: 202, right: 110, bottom: 210, width: 8, height: 8 };
+  const appImg = new dom.StubElement('img');
+  appImg._rect = { left: 102, top: 202, right: 110, bottom: 210, width: 8, height: 8 };
+  slot.append(appImg);
+  row.append(slot, 'one');
+
+  const refId = 'AccountUserId_user~refimage_one';
+  const pointers = { assetPointer: 'sediment://file_one', thumbnailAssetPointer: null };
+  row.__reactFiber$x = { key: `reference-image:${refId}`, child: { memoizedProps: pointers, child: null, sibling: null }, return: null };
+
+  const section = new dom.StubElement('div');
+  section.setAttribute('data-mention-section-id', 'reference-images');
+  section.append(row);
+
+  const database = mockDatabase();
+  const intervals = new Map();
+  let nextIntervalId = 1;
+  const winListeners = new Map();
+
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/',
+    document: {
+      ...dom.document,
+      querySelectorAll: selector => {
+        if (selector.includes('[data-list-navigation-item]')) return [row];
+        if (selector.includes('data-mention-section-id')) return [section];
+        return [];
+      },
+    },
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    getComputedStyle: () => ({ position: 'static', borderRadius: '4px' }),
+    indexedDB: database,
+    Blob,
+    innerWidth: 1280,
+    innerHeight: 1000,
+    fetch: async input => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      throw new Error(`Unexpected network call: ${url.pathname}`);
+    },
+    window: () => ({
+      module: { exports: { sentinel: true } }, // Must not abort browser runtime initialization.
+      localStorage: stateStorage(),
+      setInterval: fn => { const id = nextIntervalId++; intervals.set(id, fn); return id; },
+      clearInterval: id => { intervals.delete(id); },
+      addEventListener: (type, fn) => {
+        const set = winListeners.get(type) || new Set();
+        set.add(fn);
+        winListeners.set(type, set);
+      },
+      history: { pushState() {}, replaceState() {} },
+    }),
+    expose: ['window.testMentions = composerMentions;', 'window.testHover = hoverPreview;',
+      'window.testConfig = CONFIG;', 'window.testStorage = storage;', 'window.testCache = thumbnailCache;',
+      'window.testScope = s => { activeScope = s; };', 'window.testDoc = document;'],
+  });
+
+  assert.equal(typeof window.__referenceMenuFastStatus, 'function', 'window.module.exports must not disable browser runtime');
+  assert.deepEqual(window.module.exports, { sentinel: true });
+  assert.equal(intervals.size, 0, 'route timer must stay paused while document is hidden');
+
+  // Toggle visibility and pagehide/pageshow.
+  window.testDoc.hidden = false;
+  dom.document.emit('visibilitychange');
+  assert.equal(intervals.size, 1, 'route timer starts when visible');
+  for (const fn of winListeners.get('pagehide') || []) fn();
+  assert.equal(intervals.size, 0, 'route timer stops on pagehide');
+  for (const fn of winListeners.get('pageshow') || []) fn();
+  assert.equal(intervals.size, 1, 'route timer resumes on pageshow when visible');
+  window.testDoc.hidden = true;
+  dom.document.emit('visibilitychange');
+  assert.equal(intervals.size, 0, 'route timer stops when hidden again');
+
+  // Seed stored thumbnail + large preview for AccountUserId_user + account.
+  await new Promise(resolve => setImmediate(resolve));
+  const scope = JSON.stringify(['AccountUserId_user', 'account']);
+  const thumbKey = JSON.stringify([scope, 'file_one']);
+  const thumbDataUrl = 'data:image/webp;base64,bWVudGlvbg==';
+  database.stores.get('thumbnails').set(thumbKey, {
+    key: thumbKey, savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000, dataUrl: thumbDataUrl,
+  });
+  const prevKey = JSON.stringify([scope, refId, 'sediment://file_one', null]);
+  database.stores.get('previews').set(prevKey, {
+    key: prevKey, scope, savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000,
+    blob: new Blob(['stored-mention-preview'], { type: 'image/webp' }),
+  });
+
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer test', 'ChatGPT-Account-ID': 'account' },
+  });
+  await until(() => window.__referenceMenuFastStatus().identityReady, 'identity not ready');
+  window.testMentions.paintIcons();
+  await until(() => row.querySelector('[data-ref-fast-mention-icon]'), 'scaled @ suggestion icon overlay was not inserted');
+  window.testMentions.sync();
+
+  const overlay = row.querySelector('[data-ref-fast-mention-icon]');
+  assert.ok(overlay, 'scaled @ suggestion icon overlay must be inserted');
+  assert.equal(overlay.style.left, '4px');
+  assert.equal(overlay.style.top, '4px');
+  assert.equal(overlay.style.width, '16px');
+  assert.equal(overlay.style.height, '16px');
+
+  await until(() => /^blob:/.test(window.testHover.target?.context?.stored || ''),
+    'new chat @ highlight did not open stored large preview');
+  assert.equal(window.__referenceMenuFastStatus().cacheChat.running, false);
+  window.testHover.close();
+
+  // 2. Storage.prune + ThumbnailCache.pruneThumbnails (index cursor + expired + accessedAt eviction + protected preservation).
+  const table = database.stores.get('thumbnails');
+  table.clear();
+  const expiredKey = JSON.stringify([scope, 'file_expired']);
+  const oldKey = JSON.stringify([scope, 'file_old']);
+  const keepKey = JSON.stringify([scope, 'file_keep']);
+  const protectedKey = JSON.stringify([scope, 'file_protected']);
+  const now = Date.now();
+  table.set(expiredKey, { key: expiredKey, savedAt: now - 40 * 86400000, accessedAt: 5, dataUrl: thumbDataUrl });
+  table.set(oldKey, { key: oldKey, savedAt: now - 1000, accessedAt: 10, dataUrl: thumbDataUrl });
+  table.set(protectedKey, { key: protectedKey, savedAt: now - 1000, accessedAt: 20, dataUrl: thumbDataUrl });
+  table.set(keepKey, { key: keepKey, savedAt: now - 1000, accessedAt: 30, dataUrl: thumbDataUrl });
+
+  const removed = await window.testStorage.prune(new Set([protectedKey]), 2);
+  assert.deepEqual([...removed], [expiredKey, oldKey]);
+  assert.equal(table.has(expiredKey), false);
+  assert.equal(table.has(oldKey), false);
+  assert.equal(table.has(protectedKey), true);
+  assert.equal(table.has(keepKey), true);
+
+  // Also test pruneThumbnails updates memory cleanly.
+  window.testScope(scope);
+  table.set(expiredKey, { key: expiredKey, savedAt: now - 40 * 86400000, accessedAt: 5, dataUrl: thumbDataUrl });
+  window.testCache.memory.set(expiredKey, table.get(expiredKey));
+  await window.testCache.pruneThumbnails();
+  assert.equal(window.testCache.memory.has(expiredKey), false);
+  assert.equal(table.has(expiredKey), false);
+  window.testCache.accessWrites.clear();
+});
+
+test('H2 후속: /me 401·쿠키 사용자 전환은 이전 자격 증명을 지워 느린 응답 복구를 막고, 카탈로그 초기화 중 회전된 토큰도 activeTransport에 반영한다', async () => {
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  const two = { ...ref('two'), id: 'AccountUserId_user~refimage_two' };
+  let meStatus = 200;
+  let currentUser = 'user-1';
+  let slowBeforeLogoutGate = null;
+  let slowBeforeSwitchGate = null;
+  let bootstrapGate = null;
+  const listAuths = [];
+  const database = mockDatabase();
+  const makeFetch = () => async (input, init) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    const headers = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers).forEach((v, k) => headers.set(k, v));
+    if (url.pathname === '/backend-api/me') {
+      return meStatus === 200 ? new Response(JSON.stringify({ id: currentUser })) : new Response('{}', { status: meStatus });
+    }
+    if (url.pathname === '/backend-api/conversations') {
+      const auth = headers.get('Authorization');
+      if (auth === 'Bearer u1-slow-logout' && slowBeforeLogoutGate) await slowBeforeLogoutGate;
+      if (auth === 'Bearer u1-slow-switch' && slowBeforeSwitchGate) await slowBeforeSwitchGate;
+      return new Response('{}', { status: 200 });
+    }
+    if (url.pathname.endsWith('/reference-images')) {
+      const cursor = url.searchParams.get('cursor');
+      listAuths.push({ cursor, auth: headers.get('Authorization') });
+      if (cursor === null && bootstrapGate) await bootstrapGate;
+      if (cursor === null) return new Response(JSON.stringify({ items: [one], next_cursor: 'p2' }));
+      return new Response(JSON.stringify({ items: [two], next_cursor: null }));
+    }
+    if (url.pathname.endsWith('/thumbnail_url')) {
+      listAuths.push({ path: 'thumbnail_url', auth: headers.get('Authorization') });
+      const id = decodeURIComponent(url.pathname.split('/').at(-2));
+      const fileId = id.endsWith('two') ? 'file_two' : 'file_one';
+      return new Response(JSON.stringify({ thumbnail_url: `https://chatgpt.com/backend-api/estuary/content?id=${fileId}` }));
+    }
+    if (url.pathname.endsWith('/estuary/content')) return new Response('valid-image', { headers: { 'Content-Type': 'image/png' } });
+    throw new Error(`Unexpected ${url.pathname}`);
+  };
+
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/c/test-h2-followup',
+    fetch: makeFetch(),
+    indexedDB: database,
+    Blob,
+    createImageBitmap: async () => ({ width: 48, height: 48, close() {} }),
+    document: {
+      createElement: () => ({
+        getContext: () => ({ drawImage() {} }),
+        toBlob: cb => cb(new Blob(['scaled'], { type: 'image/webp' })),
+        toDataURL: () => 'data:image/webp;base64,YWJj',
+      }),
+    },
+    window: () => ({ localStorage: stateStorage(), history: { pushState() {}, replaceState() {} } }),
+    expose: ['window.testCatalog = catalogController;', 'window.testCache = thumbnailCache;',
+      'window.testTransport = () => activeTransport;',
+      'window.testAuthState = () => ({ userId, account: requestContext?.account ?? null, auth: requestContext?.headers.get("Authorization") ?? null, sessionAuth: cacheSession.context?.authorization ?? null, sessionKey: cacheSession.context?.key ?? null });'],
+  });
+
+  // 1. Slow pre-logout GET finishing after /me 401 must not resurrect requestContext.
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer u1-token', 'ChatGPT-Account-ID': 'acc-1' },
+  });
+  await until(() => window.testAuthState().auth === 'Bearer u1-token', 'initial user-1 login missing');
+  let releaseLogoutSlow;
+  slowBeforeLogoutGate = new Promise(resolve => { releaseLogoutSlow = resolve; });
+  const slowLogoutReq = window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer u1-slow-logout', 'ChatGPT-Account-ID': 'acc-1' },
+  });
+  meStatus = 401;
+  await window.fetch('https://chatgpt.com/backend-api/me');
+  assert.equal(window.testAuthState().userId, null);
+  assert.equal(window.testAuthState().auth, null);
+  releaseLogoutSlow();
+  await slowLogoutReq;
+  assert.equal(window.testAuthState().auth, null, 'slow GET started before /me 401 must not restore requestContext');
+
+  // 2. Cookie-only /me user switch must drop prior user's requestContext and ignore slow GET from prior user.
+  meStatus = 200;
+  currentUser = 'user-1';
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer u1-token2', 'ChatGPT-Account-ID': 'acc-1' },
+  });
+  await until(() => window.testAuthState().userId === 'user-1' && window.testAuthState().auth === 'Bearer u1-token2',
+    'user-1 re-login missing');
+  let releaseSwitchSlow;
+  slowBeforeSwitchGate = new Promise(resolve => { releaseSwitchSlow = resolve; });
+  const slowSwitchReq = window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer u1-slow-switch', 'ChatGPT-Account-ID': 'acc-1' },
+  });
+  currentUser = 'user-2';
+  await window.fetch('https://chatgpt.com/backend-api/me'); // Cookie-only: no Authorization header.
+  await until(() => window.testAuthState().userId === 'user-2', 'cookie-only user switch did not update userId');
+  assert.equal(window.testAuthState().auth, null, 'cookie-only user switch must clear prior user requestContext');
+  assert.equal(window.testAuthState().sessionAuth, null, 'must not publish new userId paired with old Bearer token');
+  releaseSwitchSlow();
+  await slowSwitchReq;
+  assert.equal(window.testAuthState().auth, null, 'slow GET started before user switch must not restore old token');
+
+  // 3. Token rotation during bootstrapCatalog await updates activeTransport so page 2 and verification use the new token.
+  await window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer u2-v1', 'ChatGPT-Account-ID': 'acc-2' },
+  });
+  let releaseBootstrap;
+  bootstrapGate = new Promise(resolve => { releaseBootstrap = resolve; });
+  window.testCatalog.refreshOnOpen();
+  await until(() => listAuths.some(entry => entry.cursor === null && entry.auth === 'Bearer u2-v1'),
+    'bootstrapCatalog did not send page 1');
+  await window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer u2-v2-rotated', 'ChatGPT-Account-ID': 'acc-2' },
+  });
+  bootstrapGate = null;
+  releaseBootstrap();
+  await until(() => listAuths.some(entry => entry.cursor === 'p2'), 'page 2 did not run');
+  const page2Auth = listAuths.find(entry => entry.cursor === 'p2');
+  assert.equal(page2Auth.auth, 'Bearer u2-v2-rotated', 'page 2 must send token rotated during bootstrapCatalog await');
+  await window.testTransport().api.verify(two.id);
+  assert.equal(listAuths.at(-1).auth, 'Bearer u2-v2-rotated');
+
+  // 4. Token rotation during serveStoredCatalog await updates activeTransport before refreshIfDue runs.
+  const storedDb = mockDatabase();
+  listAuths.length = 0;
+  const second = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/c/test-h2-followup',
+    fetch: makeFetch(),
+    indexedDB: storedDb,
+    Blob,
+    createImageBitmap: async () => ({ width: 48, height: 48, close() {} }),
+    document: {
+      createElement: () => ({
+        getContext: () => ({ drawImage() {} }),
+        toBlob: cb => cb(new Blob(['scaled'], { type: 'image/webp' })),
+        toDataURL: () => 'data:image/webp;base64,YWJj',
+      }),
+    },
+    window: () => ({ localStorage: stateStorage(), history: { pushState() {}, replaceState() {} } }),
+    expose: ['window.testCatalog = catalogController;', 'window.testCache = thumbnailCache;',
+      'window.testTransport = () => activeTransport;'],
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  const seededScope = seedCatalog(storedDb, [one, two], { account: 'acc-2', identity: 'user-2', ageMinutes: 60 });
+  assert.ok(seededScope);
+  await second.window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer u2-v2', 'ChatGPT-Account-ID': 'acc-2' },
+  });
+  await until(() => second.window.__referenceMenuFastStatus().identityReady, 'second runtime identity missing');
+  let releaseStored, storedStarted = false;
+  const storedGate = new Promise(resolve => { releaseStored = resolve; });
+  const origCachedForAccount = second.window.testCatalog.cachedForAccount.bind(second.window.testCatalog);
+  second.window.testCatalog.cachedForAccount = async (...args) => {
+    storedStarted = true;
+    await storedGate;
+    return origCachedForAccount(...args);
+  };
+  second.window.testCatalog.refreshOnOpen();
+  await until(() => storedStarted, 'serveStoredCatalog did not enter cachedForAccount');
+  await second.window.fetch('https://chatgpt.com/backend-api/conversations', {
+    headers: { Authorization: 'Bearer u2-v3-stored', 'ChatGPT-Account-ID': 'acc-2' },
+  });
+  releaseStored();
+  await until(() => listAuths.some(entry => entry.cursor === null), 'serveStoredCatalog refreshIfDue did not fetch');
+  assert.equal(listAuths.find(entry => entry.cursor === null).auth, 'Bearer u2-v3-stored',
+    'serveStoredCatalog must sync token rotated while reading stored catalog');
+  window.testCache.accessWrites.clear();
+  second.window.testCache.accessWrites.clear();
+});
+
+test('M2 후속: readOnlySnapshot은 개인 계정 로그인·로그아웃 전환 시 같은 items 배열이어도 스코프를 갱신한다', async () => {
+  const dom = createDomStub({ hidden: true });
+  const items = [{ ...ref('one'), id: 'AccountUserId_owner~refimage_one' }];
+  const providerFiber = {
+    memoizedProps: { cacheKey: 'personal-cache', items: [], onRecreate() {} },
+    updateQueue: {
+      memoCache: {
+        data: [[{
+          get() {},
+          query: true,
+          queryClient: {
+            getQueryCache: () => ({
+              findAll: () => [{ queryKey: ['chatgpt-reference-images', 'personal-user', 'personal-cache'], state: { data: items }, options: {} }],
+            }),
+          },
+        }]],
+      },
+    },
+    return: null,
+  };
+  const menuItem = new dom.StubElement('div');
+  menuItem.setAttribute('role', 'menuitem');
+  menuItem.append('Ref one');
+  menuItem.__reactFiber$test = { key: items[0].id, return: providerFiber };
+  const menu = new dom.StubElement('div');
+  menu.setAttribute('role', 'menu');
+  menu.append(menuItem);
+
+  let meStatus = 200;
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/space/file/libfile_x',
+    document: dom.document,
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    getComputedStyle: dom.getComputedStyle,
+    indexedDB: mockDatabase(),
+    Blob,
+    fetch: async input => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') {
+        return meStatus === 200 ? new Response(JSON.stringify({ id: 'personal-user' })) : new Response('{}', { status: meStatus });
+      }
+      throw new Error(`Unexpected ${url.pathname}`);
+    },
+    window: () => ({ localStorage: stateStorage(), history: { pushState() {}, replaceState() {} } }),
+    expose: ['window.testMenuController = menuController;'],
+  });
+
+  // 1. Before login (personal account: account === null, requestContext === null).
+  const beforeLogin = window.testMenuController.readOnlySnapshot({ menu });
+  assert.ok(beforeLogin);
+  assert.equal(beforeLogin.scope, null, 'unauthenticated personal account snapshot must have null scope');
+
+  // 2. Log in with personal account (no ChatGPT-Account-ID header -> account remains null), reusing same items array.
+  await window.fetch('https://chatgpt.com/backend-api/me', {
+    headers: { Authorization: 'Bearer personal-1' },
+  });
+  await until(() => window.__referenceMenuFastStatus().identityReady, 'personal login did not settle');
+  const afterLogin = window.testMenuController.readOnlySnapshot({ menu });
+  assert.equal(afterLogin.scope, JSON.stringify(['AccountUserId_owner', 'server-verified']),
+    'same items array must rebuild snapshot with non-null scope after personal-account login');
+  assert.equal(window.testMenuController.readOnlySnapshot({ menu }), afterLogin,
+    'unchanged auth state reuses memoized snapshot');
+
+  // 3. Logout (/me 401) must clear scope even when items array reference is unchanged.
+  meStatus = 401;
+  await window.fetch('https://chatgpt.com/backend-api/me');
+  const afterLogout = window.testMenuController.readOnlySnapshot({ menu });
+  assert.equal(afterLogout.scope, null,
+    'same items array must drop scope after /me 401 logout');
+});
+
+test('수동 새로고침은 이미 저장된 이미지는 건너뛰고 실패한 작은 썸네일·큰 미리보기를 세션당 한 번씩만 다시 시도한다', async () => {
+  const refId = name => ({ ...ref(name), id: `AccountUserId_user~refimage_${name}` });
+  const one = refId('one'), two = refId('two'), three = refId('three');
+  let twoOk = false;
+  let holdTail = false;
+  let tailGate = null;
+  const h = cacheWorkerHarness({
+    pages: new Map([
+      [null, { items: [one, two], next_cursor: 'tail' }],
+      ['tail', { items: [three], next_cursor: null }],
+    ]),
+    request: cursor => {
+      if (cursor === 'tail' && holdTail) {
+        return new Promise(resolve => {
+          tailGate = () => resolve(new Response(JSON.stringify({ items: [three], next_cursor: null })));
+        });
+      }
+      return Promise.resolve(new Response(JSON.stringify(cursor === 'tail'
+        ? { items: [three], next_cursor: null }
+        : { items: [one, two], next_cursor: 'tail' })));
+    },
+    image: id => id === 'file_two' && !twoOk
+      ? new Response('missing', { status: 404 })
+      : new Response('valid-image', { headers: { 'Content-Type': 'image/png' } }),
+  });
+
+  const state = { status: {}, input: { value: '' } };
+  try {
+    await h.open();
+    await h.window.fetch('https://chatgpt.com/backend-api/files/library/reference-images?cursor=tail', {
+      headers: { 'ChatGPT-Account-ID': 'account' },
+    });
+    await until(() =>
+      !h.status().backgroundCatalogRefreshes &&
+      h.status().thumbnailProgress.total === 3 &&
+      h.status().thumbnailProgress.pending === 0 &&
+      h.status().previewProgress.total === 3 &&
+      h.status().previewProgress.pending === 0 &&
+      h.status().previewTasks === 0 &&
+      h.status().activeDownloads === 0,
+    'initial multi-page cache did not settle');
+
+    assert.deepEqual({ ...h.status().thumbnailProgress }, {
+      total: 3, discovered: 3, ready: 2, failed: 1, pending: 0, complete: false,
+    });
+    assert.deepEqual({ ...h.status().previewProgress }, {
+      total: 3, discovered: 3, ready: 2, failed: 1, pending: 0, complete: false,
+    });
+
+    const countFile = file => h.calls.images.filter(id => id === file).length;
+    const countLookup = id => h.calls.lookups.filter(seen => seen === id).length;
+    const oneDownloads = countFile('file_one'), threeDownloads = countFile('file_three');
+    const oneLookups = countLookup(one.id), threeLookups = countLookup(three.id);
+    const scope = [...h.catalog.records.keys()][0];
+
+    // Automatic 30-minute refresh (restart: false) must preserve ready items and skip previously failed images.
+    h.catalog.records.get(scope).savedAt = Date.now() - 31 * 60 * 1000;
+    const metaBeforeAuto = h.calls.metadata.length;
+    const twoBeforeAuto = countFile('file_two');
+    twoOk = true;
+    h.catalog.refreshOnOpen();
+    await until(() => h.calls.metadata.length >= metaBeforeAuto + 2 && !h.status().backgroundCatalogRefreshes,
+      '30-minute auto refresh did not finish');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(countFile('file_two'), twoBeforeAuto, 'auto refresh must not retry failed images');
+    assert.equal(h.status().thumbnailProgress.failed, 1);
+    assert.equal(h.status().previewProgress.failed, 1);
+    assert.equal(countFile('file_one'), oneDownloads);
+    assert.equal(countFile('file_three'), threeDownloads);
+    assert.equal(countLookup(one.id), oneLookups);
+    assert.equal(countLookup(three.id), threeLookups);
+
+    // Manual refresh retries each failed thumbnail/preview at most once per session (onPage vs onComplete).
+    twoOk = false;
+    holdTail = true;
+    const twoBeforeFirstManual = countFile('file_two');
+    h.menuController.refreshList(state);
+    await until(() =>
+      tailGate &&
+      countFile('file_two') > twoBeforeFirstManual &&
+      h.status().thumbnailProgress.failed === 1 &&
+      h.status().previewProgress.failed === 1 &&
+      h.status().previewTasks === 0 &&
+      h.status().activeDownloads === 0 &&
+      h.status().backgroundQueued === 0,
+    'page 1 retry during held manual refresh did not settle');
+
+    const twoDownloadsAfterPage1 = countFile('file_two');
+    const twoLookupsAfterPage1 = countLookup(two.id);
+    twoOk = true;
+    holdTail = false;
+    tailGate();
+    await until(() => !h.status().backgroundCatalogRefreshes, 'held manual refresh did not complete');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(countFile('file_two'), twoDownloadsAfterPage1, 'onComplete must not re-retry within the same refresh session');
+    assert.equal(countLookup(two.id), twoLookupsAfterPage1);
+    assert.equal(h.status().thumbnailProgress.failed, 1);
+    assert.equal(h.status().previewProgress.failed, 1);
+
+    // Clicking manual refresh again recovers failed thumbnails and previews without re-downloading cached items.
+    h.menuController.refreshList(state);
+    await until(() =>
+      !h.status().backgroundCatalogRefreshes &&
+      h.status().thumbnailProgress.complete &&
+      h.status().previewProgress.complete,
+    'second manual refresh did not recover failed images');
+
+    assert.deepEqual({ ...h.status().thumbnailProgress }, {
+      total: 3, discovered: 3, ready: 3, failed: 0, pending: 0, complete: true,
+    });
+    assert.deepEqual({ ...h.status().previewProgress }, {
+      total: 3, discovered: 3, ready: 3, failed: 0, pending: 0, complete: true,
+    });
+    assert.equal(countFile('file_one'), oneDownloads, 'cached item one must not be redownloaded');
+    assert.equal(countFile('file_three'), threeDownloads, 'cached item three must not be redownloaded');
+    assert.equal(countLookup(one.id), oneLookups);
+    assert.equal(countLookup(three.id), threeLookups);
+  } finally {
+    h.cache.accessWrites.clear();
+  }
+});
+test('용량 초과 쓰기 오류로 일시중단된 캐시는 수동 새로고침에서도 재다운로드 루프를 돌지 않는다', async () => {
+  const refId = name => ({ ...ref(name), id: `AccountUserId_user~refimage_${name}` });
+  const one = refId('one'), two = refId('two');
+  let items = [one];
+  let quotaExceeded = false;
+  const h = cacheWorkerHarness({
+    pages: new Map([[null, { items: [one], next_cursor: null }]]),
+    request: () => Promise.resolve(new Response(JSON.stringify({ items, next_cursor: null }))),
+    lookup: id => {
+      const item = [one, two].find(entry => entry.id === id);
+      return new Response(JSON.stringify({
+        thumbnail_url: 'https://chatgpt.com/backend-api/estuary/content?id=' + item.asset_pointer.slice('sediment://'.length),
+      }));
+    },
+    commit: (name, mode) => {
+      if (quotaExceeded && mode === 'readwrite' && (name === 'thumbnails' || name === 'previews')) {
+        throw new DOMException('Quota exceeded', 'QuotaExceededError');
+      }
+    },
+  });
+
+  const state = { status: {}, input: { value: '' } };
+  try {
+    await h.open();
+    await until(() =>
+      !h.status().backgroundCatalogRefreshes &&
+      h.status().thumbnailProgress.complete &&
+      h.status().previewProgress.complete,
+    'initial single-item cache did not complete');
+
+    items = [one, two];
+    quotaExceeded = true;
+    h.menuController.refreshList(state);
+    await until(() =>
+      !h.status().backgroundCatalogRefreshes &&
+      h.status().cacheStorageFailed &&
+      h.status().previewCachePaused &&
+      h.status().thumbnailProgress.failed === 1 &&
+      h.status().previewProgress.failed === 1 &&
+      h.status().previewTasks === 0 &&
+      h.status().activeDownloads === 0 &&
+      h.status().backgroundQueued === 0,
+    'quota write error did not pause both thumbnail and preview caches');
+
+    const lookupsBefore = h.calls.lookups.length;
+    const imagesBefore = h.calls.images.length;
+    const metaBefore = h.calls.metadata.length;
+
+    h.menuController.refreshList(state);
+    await until(() => h.calls.metadata.length >= metaBefore + 1 && !h.status().backgroundCatalogRefreshes,
+      'manual refresh while write-paused did not complete');
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.equal(h.calls.lookups.length, lookupsBefore, 'quota-paused manual refresh must not re-lookup failed images');
+    assert.equal(h.calls.images.length, imagesBefore, 'quota-paused manual refresh must not re-download failed images');
+    assert.equal(h.status().cacheStorageFailed, true);
+    assert.equal(h.status().previewCachePaused, true);
+    assert.deepEqual({ ...h.status().thumbnailProgress }, {
+      total: 2, discovered: 2, ready: 1, failed: 1, pending: 0, complete: false,
+    });
+    assert.deepEqual({ ...h.status().previewProgress }, {
+      total: 2, discovered: 2, ready: 1, failed: 1, pending: 0, complete: false,
+    });
+  } finally {
+    h.cache.accessWrites.clear();
+  }
+});
+
+test('Azure Blob SAS 매칭·fileKey 경계·verifiedOwner·menuAvatarRequest·DownloadQueue·CatalogSession 임시 소유자 회귀', async () => {
+  const dashedUuid = '7a2f1c3d-4e5b-4a6b-8c9d-0e1f2a3b4c5d';
+  const hexUuid = dashedUuid.replace(/-/g, '');
+  const hexRef = { asset_pointer: `sediment://file_${hexUuid}`, thumbnail_asset_pointer: null };
+  const dashedRef = { asset_pointer: `sediment://file_${dashedUuid}`, thumbnail_asset_pointer: null };
+  const sasUrl = `https://sdmntpreastus2.oaiusercontent.com/files/0000000018a07206_${dashedUuid}/drvs/thumbnail?se=2099-01-01T00%3A00%3A00Z&sig=ok`;
+  assert.equal(thumbnailMatchesReference(sasUrl, hexRef), true);
+  assert.equal(thumbnailMatchesReference(sasUrl, dashedRef), true);
+  assert.equal(thumbnailMatchesReference(sasUrl.replace('/thumbnail', ''), hexRef), true);
+  assert.equal(thumbnailMatchesReference(`https://sdmntpreastus2.oaiusercontent.com/files/${hexUuid}/drvs/thumbnail`, dashedRef), true);
+  assert.equal(thumbnailMatchesReference('https://sdmntpreastus2.oaiusercontent.com/files/00000000_00000000-0000-4000-8000-000000000000/drvs/thumbnail', hexRef), false);
+  assert.equal(thumbnailMatchesReference(`https://sdmntpreastus2.oaiusercontent.com/files/00_${dashedUuid}/files/01_${dashedUuid}/drvs/thumbnail`, hexRef), false);
+  assert.equal(thumbnailMatchesReference(`https://evil.example.com/files/0000000018a07206_${dashedUuid}/drvs/thumbnail`, hexRef), false);
+  assert.equal(thumbnailMatchesReference(sasUrl.replace('https://', 'http://'), hexRef), false);
+
+  assert.equal(fileKey('prefixfile_abc'), null);
+  assert.equal(fileKey('sediment://file_abc-123'), 'file_abc-123');
+  assert.equal(pointerFileHex(`file_${dashedUuid}`), hexUuid);
+  assert.equal(pointerFileHex('file_short'), null);
+  assert.equal(verifiedOwner([{ id: 'AccountUserId_u1~r1' }, { id: 'AccountUserId_u2~r2' }]), null);
+  assert.equal(verifiedOwner([{ id: 'AccountUserId_u1~r1' }, { id: 'unscoped' }]), null);
+  assert.equal(verifiedOwner([{ id: 'AccountUserId_u1~r1' }]), 'AccountUserId_u1');
+
+  assert.deepEqual(menuAvatarRequest(new URL('https://chatgpt.com/backend-api/estuary/content?id=file_abc'), 'GET'),
+    { file: 'file_abc', kind: 'image' });
+  assert.deepEqual(menuAvatarRequest(new URL('https://chatgpt.com/backend-api/files/download/file_abc?download_intent=false&inline=true'), 'GET'),
+    { file: 'file_abc', kind: 'metadata' });
+  assert.equal(menuAvatarRequest(new URL('https://chatgpt.com/backend-api/files/download/file_abc?download_intent=false&inline=true'), 'POST'), null);
+  assert.equal(menuAvatarRequest(new URL('https://chatgpt.com/backend-api/files/download/file_abc?download_intent=false'), 'GET'), null);
+
+  let fgChecks = 0;
+  const queue = new DownloadQueue(1, 1);
+  let releaseFirst;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const order = [];
+  const p1 = queue.run(async () => { order.push('fg-start'); await firstGate; order.push('fg-end'); }, undefined, () => { fgChecks++; return true; });
+  const bgAbort = new AbortController();
+  const pBgAborted = queue.run(async () => { order.push('should-not-run'); }, bgAbort.signal, () => false);
+  const p2 = queue.run(async () => { order.push('fg2'); }, undefined, () => true);
+  assert.equal(queue.active, 1);
+  assert.equal(queue.size, 2);
+  assert.ok(fgChecks >= 1);
+  bgAbort.abort();
+  await assert.rejects(pBgAborted, error => error?.name === 'AbortError');
+  assert.equal(queue.size, 1);
+  releaseFirst();
+  await Promise.all([p1, p2]);
+  assert.deepEqual(order, ['fg-start', 'fg-end', 'fg2']);
+  assert.equal(queue.size, 0);
+
+  const page2Ref = { ...ref('two'), id: 'AccountUserId_promo~ref_two' };
+  const indexed = [], stored = [];
+  let promotedOwner = null;
+  const session = new CatalogSession({
+    request: async cursor => {
+      assert.equal(cursor, 'p2');
+      return new Response(JSON.stringify({ items: [page2Ref], next_cursor: null }));
+    },
+    provisional: true,
+    onOwner: owner => { promotedOwner = owner; },
+    onPage: items => indexed.push(items.map(item => item.id)),
+    onComplete: pages => stored.push(pages),
+  });
+  await session.prime(null, { items: [], next_cursor: 'p2' });
+  await session.start();
+  assert.equal(promotedOwner, 'AccountUserId_promo');
+  assert.equal(session.owner, 'AccountUserId_promo');
+  assert.deepEqual(indexed, [[], [page2Ref.id]]);
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].length, 2);
+});
+
+test('캐싱 모드 download 메타데이터 폭주 억제·JSON release 및 쓰기 오류 시 cachedThumbnail 우선 서빙', async () => {
+  const dom = createDomStub();
+  const menu = new dom.StubElement('div');
+  menu.setAttribute('role', 'menu');
+  const rowOne = new dom.StubElement('div');
+  rowOne.setAttribute('role', 'menuitem');
+  rowOne.append('one');
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  rowOne.__reactFiber$x = { key: one.id, memoizedProps: { item: one }, child: null, sibling: null, return: null };
+  menu.append(rowOne);
+  dom.document.body.append(menu);
+
+  let metadataHits = 0;
+  let releaseThumb;
+  const thumbGate = new Promise(resolve => { releaseThumb = resolve; });
+  const database = mockDatabase();
+  const scope = JSON.stringify(['AccountUserId_user', 'account']);
+  const cachedKey = JSON.stringify([scope, 'file_cached']);
+
+  const { window } = loadRuntime({
+    managed: false,
+    href: 'https://chatgpt.com/c/test-meta',
+    document: {
+      ...dom.document,
+      querySelector: s => (s === '[role="menu"]' ? menu : null),
+      querySelectorAll: s => (s === '[role="menu"]' ? [menu] : []),
+      createElement: tag => tag === 'canvas'
+        ? { getContext: () => ({ drawImage() {} }), toBlob: cb => cb(new Blob(['p'], { type: 'image/webp' })),
+          toDataURL: () => 'data:image/webp;base64,YWJj' }
+        : new dom.StubElement(tag),
+    },
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    innerHeight: 1000,
+    indexedDB: database,
+    Blob,
+    createImageBitmap: async () => ({ width: 48, height: 48, close() {} }),
+    window: () => ({ localStorage: stateStorage(), history: { pushState() {}, replaceState() {} } }),
+    fetch: async input => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      if (url.pathname.endsWith('/reference-images')) {
+        return new Response(JSON.stringify({ items: [one], next_cursor: null }));
+      }
+      if (url.pathname.endsWith('/thumbnail_url')) {
+        await thumbGate;
+        return new Response(JSON.stringify({ thumbnail_url: 'https://chatgpt.com/backend-api/estuary/content?id=file_one' }));
+      }
+      if (url.pathname.endsWith('/estuary/content')) return new Response('valid-image', { headers: { 'Content-Type': 'image/png' } });
+      if (url.pathname === '/backend-api/files/download/file_one') {
+        metadataHits++;
+        return new Response(JSON.stringify({ download_url: 'https://cdn.example.invalid/json-real' }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      throw new Error(`Unexpected ${url.pathname}`);
+    },
+    expose: ['window.testLoader = thumbnailLoader;', 'window.testMenus = menuController;',
+      'window.testBridge = nativeBridge;', 'window.testCache = thumbnailCache;',
+      'window.testSetWriteFail = v => { storageWriteFailed = v; };', 'window.testInventory = inventory;',
+      'window.testActiveScope = () => activeScope;'],
+  });
+
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    database.stores.get('thumbnails').set(cachedKey, {
+      key: cachedKey, savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000, dataUrl: 'data:image/webp;base64,Y2FjaGVk',
+    });
+
+    await window.fetch('https://chatgpt.com/backend-api/me', { headers: { Authorization: 'Bearer tok', 'ChatGPT-Account-ID': 'account' } });
+    await until(() => window.__referenceMenuFastStatus().identityReady, 'identity not ready');
+    await window.fetch('https://chatgpt.com/backend-api/files/library/reference-images?limit=50', { headers: { 'ChatGPT-Account-ID': 'account' } });
+    window.testMenus.updateMenus();
+
+    const metaPromise = window.fetch('https://chatgpt.com/backend-api/files/download/file_one?download_intent=false&inline=true');
+    await until(() => window.__referenceMenuFastStatus().waitingImages === 1, 'metadata request should be queued in pending');
+    assert.equal(metadataHits, 0, 'metadata fetch must be suppressed while menu caches/holds');
+
+    // Thumbnail save must NOT settle metadata requests with PNG bytes; keep held while menu stays open.
+    releaseThumb();
+    await until(() => window.testInventory.summary().ready === 1, 'thumbnail save did not finish');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(metadataHits, 0, 'thumbnail hit/save must not execute or contaminate metadata request');
+
+    // Releasing on click/failure must execute the real JSON perform.
+    window.testBridge.releaseNativeImages(window.testActiveScope(), 'file_one');
+    const metaResp = await metaPromise;
+    const metaJson = await metaResp.json();
+    assert.equal(metadataHits, 1);
+    assert.equal(metaJson.download_url, 'https://cdn.example.invalid/json-real');
+
+    // Under storageWriteFailed, cachedThumbnail must still resolve as ready without triggering a download.
+    window.testInventory.register([
+      { ...ref('cached'), id: 'AccountUserId_user~refimage_cached' },
+      { ...ref('uncached'), id: 'AccountUserId_user~refimage_uncached' },
+    ]);
+    window.testSetWriteFail(true);
+    let uncachedCalls = 0;
+    window.testLoader.queueThumbnail(window.testActiveScope(), 'file_cached', () => { throw new Error('must not download cached'); });
+    window.testLoader.queueThumbnail(window.testActiveScope(), 'file_uncached', () => { uncachedCalls++; });
+    await until(() => window.testInventory.summary().ready === 2 && window.testInventory.summary().failed === 1 && window.testLoader.tasks.size === 0,
+      'cached thumbnail should resolve while storageWriteFailed=true');
+    assert.equal(uncachedCalls, 0);
+    assert.equal(window.__referenceMenuFastStatus().thumbnailHits >= 1, true);
+  } finally {
+    window.testCache.accessWrites.clear();
+  }
+});
+
+test('비캐싱 읽기 전용 메뉴 아바타 요청 보류·선택/해제 시 release 및 Storage.prune 만료 레코드 우선 삭제', async () => {
+  const dom = createDomStub();
+  const docListeners = new Map();
+  dom.document.addEventListener = (type, fn) => {
+    const list = docListeners.get(type) || [];
+    list.push(fn);
+    docListeners.set(type, list);
+  };
+  const menu = new dom.StubElement('div');
+  menu.setAttribute('role', 'menu');
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  const two = { ...ref('two'), id: 'AccountUserId_user~refimage_two' };
+  const rowOne = new dom.StubElement('div');
+  rowOne.setAttribute('role', 'menuitem');
+  rowOne.append('one');
+  rowOne.__reactFiber$x = { key: one.id, child: null, sibling: null, return: null };
+  const rowTwo = new dom.StubElement('div');
+  rowTwo.setAttribute('role', 'menuitem');
+  rowTwo.append('two');
+  rowTwo.__reactFiber$x = { key: two.id, child: null, sibling: null, return: null };
+  menu.append(rowOne, rowTwo);
+  dom.document.body.append(menu);
+
+  const database = mockDatabase();
+  let imgFetches = 0;
+  const { window } = loadRuntime({
+    managed: true,
+    href: 'https://chatgpt.com/g/g-space',
+    document: {
+      ...dom.document,
+      querySelector: s => (s === '[role="menu"]' ? menu : null),
+      querySelectorAll: s => (s === '[role="menu"]' ? [menu] : []),
+    },
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    innerHeight: 1000,
+    indexedDB: database,
+    Blob,
+    window: () => ({ localStorage: stateStorage(), history: { pushState() {}, replaceState() {} } }),
+    fetch: async input => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      if (url.pathname.endsWith('/estuary/content')) {
+        imgFetches++;
+        return new Response('img', { headers: { 'Content-Type': 'image/png' } });
+      }
+      throw new Error(`Unexpected ${url.pathname}`);
+    },
+    expose: ['window.testStorage = storage;', 'window.testMenus = menuController;', 'window.testReadOnlyPending = readOnlyPending;'],
+  });
+
+  await new Promise(resolve => setImmediate(resolve));
+  const scope = seedCatalog(database, [one, two], { account: 'account', identity: 'initial-user', ageMinutes: 1 });
+  database.stores.get('thumbnails').set(JSON.stringify([scope, 'file_one']), {
+    key: JSON.stringify([scope, 'file_one']), savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000, dataUrl: 'data:image/webp;base64,b25l',
+  });
+  database.stores.get('thumbnails').set(JSON.stringify([scope, 'file_two']), {
+    key: JSON.stringify([scope, 'file_two']), savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000, dataUrl: 'data:image/webp;base64,dHdv',
+  });
+  // Also seed an expired thumbnail with a HIGHER accessedAt than valid rows to verify Storage.prune deletes expired first.
+  const newerExpiredKey = JSON.stringify([scope, 'file_expired_newer_access']);
+  database.stores.get('thumbnails').set(newerExpiredKey, {
+    key: newerExpiredKey, savedAt: Date.now() - 40 * 86400000, accessedAt: Date.now() + 999999, dataUrl: 'data:image/webp;base64,ZXhw',
+  });
+
+  const pruned = await window.testStorage.prune(new Set(), 2);
+  assert.equal(pruned.includes(newerExpiredKey), true, 'expired record with newer accessedAt must be pruned');
+  assert.equal(database.stores.get('thumbnails').has(newerExpiredKey), false);
+
+  await window.fetch('https://chatgpt.com/backend-api/me', { headers: { Authorization: 'Bearer tok', 'ChatGPT-Account-ID': 'account' } });
+  await until(() => window.__referenceMenuFastStatus().identityReady, 'identity not ready');
+  const catResp = await window.fetch('https://chatgpt.com/backend-api/files/library/reference-images?limit=50', { headers: { 'ChatGPT-Account-ID': 'account' } });
+  assert.equal((await catResp.json()).items.length, 2);
+
+  const reqOne = window.fetch('https://chatgpt.com/backend-api/estuary/content?id=file_one');
+  const ctrlTwo = new AbortController();
+  const reqTwo = window.fetch('https://chatgpt.com/backend-api/estuary/content?id=file_two', { signal: ctrlTwo.signal });
+  await until(() => window.testReadOnlyPending.size === 2, 'read-only menu avatar requests must be held');
+  assert.equal(imgFetches, 0);
+
+  // Clicking rowOne releases file_one immediately via beforeReferenceSelection -> releaseReadOnlyPending.
+  for (const fn of docListeners.get('click') || []) fn({ type: 'click', target: rowOne, button: 0, preventDefault() {}, stopImmediatePropagation() {} });
+  await reqOne;
+  assert.equal(imgFetches, 1);
+
+  // Unmounting the menu cancels remaining readOnlyPending requests.
+  menu.isConnected = false;
+  window.testMenus.updateMenus();
+  await assert.rejects(reqTwo, error => error?.name === 'AbortError');
+  assert.equal(window.testReadOnlyPending.size, 0);
+});
+
+test('beforeReferenceSelection 스페이스바 @멘션 미리보기 유지 및 pruneSelection·ComposerMentions 줄바꿈·build-extension 강화 회귀', async () => {
+  const dom = createDomStub();
+  const docListeners = new Map();
+  dom.document.addEventListener = (type, fn) => {
+    const list = docListeners.get(type) || [];
+    list.push(fn);
+    docListeners.set(type, list);
+  };
+  const menu = new dom.StubElement('div');
+  menu.setAttribute('role', 'menu');
+  const row = new dom.StubElement('div');
+  row.setAttribute('role', 'menuitem');
+  const one = { ...ref('one'), id: 'AccountUserId_user~refimage_one' };
+  let aborted = false;
+  let recreateCalls = 0;
+  row.__reactFiber$x = {
+    memoizedProps: { item: one },
+    child: null, sibling: null,
+    return: {
+      memoizedProps: { onSelect: () => { recreateCalls++; } },
+      return: null, child: null, sibling: null,
+    },
+  };
+  menu.append(row);
+  dom.document.body.append(menu);
+
+  // Wrapped inline pill whose getClientRects()[0] starts to the right of bounding rect.left.
+  const pill = new dom.StubElement('span');
+  pill.setAttribute('data-prompt-link-href', `chatgpt-reference-image://${encodeURIComponent(one.id)}?assetPointer=${encodeURIComponent(one.asset_pointer)}`);
+  pill.matches = s => s.includes('data-prompt-link-href');
+  pill.offsetWidth = 80; pill.offsetHeight = 20;
+  pill._rect = { left: 10, top: 100, right: 90, bottom: 140, width: 80, height: 40 };
+  pill.getClientRects = () => [{ left: 50, top: 100, right: 90, bottom: 120, width: 40, height: 20 }];
+  const box = new dom.StubElement('span');
+  box.offsetWidth = 14; box.offsetHeight = 14;
+  box._rect = { left: 52, top: 103, right: 66, bottom: 117, width: 14, height: 14 };
+  const pillImg = new dom.StubElement('img');
+  pillImg._rect = { ...box._rect };
+  box.append(pillImg);
+  pill.append(box, 'one');
+  dom.document.body.append(pill);
+
+  const database = mockDatabase();
+  const scope = JSON.stringify(['AccountUserId_user', 'account']);
+  const thumbKey = JSON.stringify([scope, 'file_one']);
+
+  const nonMenuEl = new dom.StubElement('div');
+  const { window } = loadRuntime({
+    managed: false,
+    href: 'https://chatgpt.com/c/test-sel',
+    document: { ...dom.document, querySelectorAll: s => (s.includes('data-prompt-link-href') ? [pill] : []) },
+    NodeFilter: dom.NodeFilter,
+    Element: dom.StubElement,
+    URLSearchParams,
+    innerHeight: 1000,
+    getComputedStyle: () => ({ position: 'static', borderRadius: '4px' }),
+    indexedDB: database,
+    Blob,
+    window: () => ({ localStorage: stateStorage(), history: { pushState() {}, replaceState() {} } }),
+    fetch: async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.pathname === '/backend-api/me') return new Response(JSON.stringify({ id: 'initial-user' }));
+      if (url.pathname.endsWith('/reference-images')) return new Response(JSON.stringify({ items: [one], next_cursor: null }));
+      if (url.pathname.endsWith('/thumbnail_url')) {
+        return new Promise((resolve, reject) => {
+          (init?.signal || input?.signal)?.addEventListener('abort', () => { aborted = true; reject(new DOMException('Aborted', 'AbortError')); }, { once: true });
+        });
+      }
+      throw new Error(`Unexpected ${url.pathname}`);
+    },
+    expose: ['window.testHover = hoverPreview;', 'window.testMentions = composerMentions;',
+      'window.testStored = storedThumbnails;', 'window.testBridge = nativeBridge;'],
+  });
+
+  await new Promise(resolve => setImmediate(resolve));
+  database.stores.get('thumbnails').set(thumbKey, {
+    key: thumbKey, savedAt: Date.now() - 1000, accessedAt: Date.now() - 1000, dataUrl: 'data:image/webp;base64,cGlsbA==',
+  });
+
+  await window.fetch('https://chatgpt.com/backend-api/me', { headers: { Authorization: 'Bearer tok', 'ChatGPT-Account-ID': 'account' } });
+  await until(() => window.__referenceMenuFastStatus().identityReady, 'identity not ready');
+
+  window.testMentions.paintIcons();
+  await until(() => pill.querySelector('[data-ref-fast-mention-icon]'), 'wrapped pill icon overlay must be inserted');
+  const overlay = pill.querySelector('[data-ref-fast-mention-icon]');
+  assert.equal(overlay.style.left, '2px', 'wrapped inline pill overlay must anchor to getClientRects()[0].left (52 - 50 = 2px)');
+  overlay.onerror?.();
+  assert.equal(pill.querySelector('[data-ref-fast-mention-icon]'), null, 'onerror must remove broken overlay');
+  assert.equal(window.testStored.records.has(thumbKey), false);
+  assert.equal(window.testStored.knownKeys.has(thumbKey), false);
+
+  // Spacebar on a non-menuitem keeps an open @-mention hoverPreview open.
+  let closedCount = 0;
+  const origClose = window.testHover.close.bind(window.testHover);
+  window.testHover.close = () => { closedCount++; origClose(); };
+  window.testHover.target = { key: 'k', context: { mention: true } };
+  for (const fn of docListeners.get('keydown') || []) fn({ type: 'keydown', key: ' ', target: nonMenuEl });
+  assert.equal(closedCount, 0, 'Spacebar outside menuitem must not close mention preview');
+
+  // pruneSelection aborts un-invoked selection when its menu disconnects.
+  const selCtrl = new AbortController();
+  selCtrl.signal.addEventListener('abort', () => { aborted = true; });
+  window.testBridge.selection = { controller: selCtrl, menu, invoked: false };
+  menu.isConnected = false;
+  window.testBridge.pruneSelection();
+  assert.equal(aborted, true);
+  assert.equal(window.testBridge.selection, null);
+  assert.equal(recreateCalls, 0);
+
+  // scripts/build-extension.mjs hardening assertions.
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { pathToFileURL } = require('node:url');
+  const mod = await import(pathToFileURL(require.resolve('./scripts/build-extension.mjs')).href);
+  const validSource = fs.readFileSync(require.resolve('./chatgpt-reference-menu.user.js'), 'utf8');
+  assert.equal(mod.isValidMatchPattern('https://chatgpt.com/*'), true);
+  assert.equal(mod.isValidMatchPattern('https://chatgpt.com'), false);
+  assert.throws(() => mod.readMetadata(validSource.replace(/\bversion:\s*'[^']+'/, '// no status version')));
+  assert.throws(() => mod.readMetadata(validSource.replace(/(\/\/ @name\s+.*)/, '$1\n// @name:xx Unknown')));
+  assert.throws(() => mod.buildManifest(mod.readMetadata(validSource), { extraMatches: ['http://chatgpt.com/*'] }));
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ref-ext-harden-'));
+  try {
+    for (const badPath of ['../escape.js', '/abs.js', 'sub\\win.js', 'manifest.json', 'reference-menu.js', 'icons/extra.png', '_locales/en/extra.json']) {
+      assert.throws(() => mod.buildExtension(path.join(tmpDir, 'out'), { extraFiles: { [badPath]: 'x' } }), `rejected path: ${badPath}`);
+    }
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

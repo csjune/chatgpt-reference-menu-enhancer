@@ -1,6 +1,3 @@
-# Private work notes
-/private/
-
 # Dependencies and generated test data
 node_modules/
 coverage/
@@ -48,3 +45,6 @@ Desktop.ini
 
 # Agent worktrees
 /.claude/worktrees/
+
+# Built extension packages
+/dist/

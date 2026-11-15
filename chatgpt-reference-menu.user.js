@@ -1,6 +1,5 @@
 // ==UserScript==
-// @name               ChatGPT 참고 이미지 메뉴 가속
-// @name:en            ChatGPT Reference Menu Enhancer
+// @name               ChatGPT Reference Menu Enhancer
 // @name:ko            ChatGPT 참고 이미지 메뉴 가속
 // @name:ja            ChatGPT 参照メニュー拡張
 // @name:zh-CN         ChatGPT 参考菜单增强
@@ -11,9 +10,8 @@
 // @name:pt-BR         Menu de referências aprimorado para ChatGPT
 // @name:ru            Улучшенное меню референсов ChatGPT
 // @namespace          local.chatgpt.reference-menu
-// @version            1.0.0
-// @description        ChatGPT 이미지 참고 자료 메뉴에 이름 검색·썸네일 캐시·큰 미리보기를 추가합니다.
-// @description:en     Adds reference-name search, cached thumbnails and larger previews to ChatGPT image reference menus.
+// @version            1.0.1
+// @description        Adds reference-name search, cached thumbnails and larger previews to ChatGPT image reference menus.
 // @description:ko     ChatGPT 이미지 참고 자료 메뉴에 이름 검색·썸네일 캐시·큰 미리보기를 추가합니다.
 // @description:ja     ChatGPT の画像参照メニューに、参照名の検索、サムネイルのキャッシュ、大きなプレビューを追加します。
 // @description:zh-CN  为 ChatGPT 图像参考菜单添加参考名称搜索、缩略图缓存和大图预览。
@@ -571,13 +569,14 @@ SOFTWARE.
       this.byId.delete(item.id);
     }
     apply(items, complete = false) {
-      const names = new Set();
+      const names = new Set(), ids = new Set();
       let changed = 0;
       for (const item of items) {
         const old = this.byId.get(item.id);
         if (old && Object.keys(item).length === Object.keys(old).length && Object.keys(item).every(key => item[key] === old[key])) continue;
         if (old) { names.add(old.entity_name); this.unlink(old); }
         names.add(item.entity_name);
+        ids.add(item.id);
         this.byId.set(item.id, item);
         for (const [map, key] of [[this.byName, item.entity_name], ...[...this.files(item)].map(file => [this.byFile, file])]) {
           const bucket = map.get(key) || [];
@@ -586,18 +585,25 @@ SOFTWARE.
         changed++;
       }
       if (complete) {
-        const ids = new Set(items.map(item => item.id));
-        for (const item of this.byId.values()) if (!ids.has(item.id)) {
-          names.add(item.entity_name); this.unlink(item); changed++;
+        const currentIds = new Set(items.map(item => item.id));
+        for (const item of this.byId.values()) if (!currentIds.has(item.id)) {
+          names.add(item.entity_name); ids.add(item.id); this.unlink(item); changed++;
         }
       }
       if (changed) this.version++;
-      return { names, changed };
+      return { names, ids, changed };
     }
   }
 
+  const FILE_KEY_PATTERN = /(?<![a-zA-Z0-9])file[_-][a-zA-Z0-9_-]+/g;
+
   function fileKey(value) {
-    return String(value || '').match(/file[_-][a-zA-Z0-9_-]+/)?.[0] || null;
+    return String(value || '').match(/(?<![a-zA-Z0-9])file[_-][a-zA-Z0-9_-]+/)?.[0] || null;
+  }
+
+  function pointerFileHex(value) {
+    const match = String(value || '').match(/^file[_-]([0-9a-f]{32}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i);
+    return match ? match[1].replace(/-/g, '').toLowerCase() : null;
   }
 
   function contentKey(url) {
@@ -613,9 +619,19 @@ SOFTWARE.
     return JSON.stringify([userId, accountId]);
   }
 
+  function referenceOwner(id) {
+    return typeof id === 'string' ? id.match(/^(AccountUserId_[A-Za-z0-9_-]+)~/)?.[1] || null : null;
+  }
+
+  function scopeOwner(scope) {
+    try { return scope ? JSON.parse(scope)[0] || null : null; }
+    catch { return null; }
+  }
+
   function verifiedOwner(items) {
-    const owners = new Set(items.map(item => item?.id?.match(/^(AccountUserId_[a-zA-Z0-9_-]+)~/)?.[1]).filter(Boolean));
-    return owners.size === 1 ? [...owners][0] : null;
+    if (!Array.isArray(items) || !items.length) return null;
+    const owner = referenceOwner(items[0]?.id);
+    return owner && items.every(item => referenceOwner(item?.id) === owner) ? owner : null;
   }
 
   function cleanReference(item) {
@@ -657,35 +673,92 @@ SOFTWARE.
     return { items: record.pages.flatMap(page => page.items), next_cursor: null };
   }
 
+  function createCatalogSnapshot({ scope, account, identity = null, record, items }) {
+    const byId = new Map(), byName = new Map();
+    for (const item of items) {
+      byId.set(item.id, item);
+      const bucket = byName.get(item.entity_name);
+      if (bucket) bucket.push(item);
+      else byName.set(item.entity_name, [item]);
+    }
+    return { scope, account, identity, record, byId, byName };
+  }
+
   function detachedDownload(fetcher, input, init) {
     return signal => fetcher(input, { ...init, signal });
   }
+
+  const OPENAI_CDN_HOST = /(^|\.)(oaiusercontent\.com|openaiusercontent\.com)$/i;
+  const OPENAI_SAS_FILE_PATH = /(?:^|\/)files\/(?:[0-9a-f]+_)?([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|[0-9a-f]{32})(?=\/|$)/gi;
 
   function thumbnailMatchesReference(url, reference) {
     try {
       const parsed = new URL(url);
       if (parsed.protocol !== 'https:') return false;
-      const file = contentKey(parsed) || fileKey(decodeURIComponent(parsed.pathname));
-      return Boolean(file && [reference.asset_pointer, reference.thumbnail_asset_pointer].some(pointer => fileKey(pointer) === file));
+      const pointers = [reference?.asset_pointer, reference?.thumbnail_asset_pointer].filter(Boolean);
+      const expectedFiles = new Set(pointers.map(fileKey).filter(Boolean));
+      if (!expectedFiles.size) return false;
+      const paramFile = contentKey(parsed);
+      if (paramFile) return expectedFiles.has(paramFile);
+      const decodedPath = decodeURIComponent(parsed.pathname);
+      const pathFiles = decodedPath.match(FILE_KEY_PATTERN) || [];
+      if (pathFiles.length) return pathFiles.length === 1 && expectedFiles.has(pathFiles[0]);
+      if (OPENAI_CDN_HOST.test(parsed.hostname)) {
+        const sasMatches = [...decodedPath.matchAll(OPENAI_SAS_FILE_PATH)];
+        if (sasMatches.length !== 1) return false;
+        const expectedHexes = new Set([...expectedFiles].map(pointerFileHex).filter(Boolean));
+        return expectedHexes.has(sasMatches[0][1].replace(/-/g, '').toLowerCase());
+      }
+      return false;
     } catch { return false; }
+  }
+
+  function menuAvatarRequest(url, method) {
+    if (method !== 'GET') return null;
+    if (url.pathname === '/backend-api/estuary/content') {
+      const file = contentKey(url);
+      return file ? { file, kind: 'image' } : null;
+    }
+    if (url.searchParams.get('inline') === 'true' && url.searchParams.get('download_intent') === 'false') {
+      const match = url.pathname.match(/^\/backend-api\/files\/download\/([^/]+)$/);
+      if (!match) return null;
+      try {
+        const file = fileKey(decodeURIComponent(match[1]));
+        return file ? { file, kind: 'metadata' } : null;
+      } catch { return null; }
+    }
+    return null;
+  }
+
+  const TRANSIENT_REQUEST_HEADERS = [
+    'x-client-request-id', 'x-request-id', 'cf-ray', 'traceparent', 'tracestate', 'baggage',
+    'accept', 'range', 'if-none-match', 'if-modified-since', 'if-match', 'if-range', 'if-unmodified-since',
+    'content-type', 'content-length', 'content-encoding',
+  ];
+
+  function cleanRequestHeaders(headers) {
+    const clean = new Headers(headers);
+    for (const name of TRANSIENT_REQUEST_HEADERS) clean.delete(name);
+    return clean;
   }
 
   function referenceTransport(fetcher, input, init, origin) {
     const source = input instanceof Request ? input : null;
-    const headers = new Headers(source?.headers);
-    new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+    let headers = cleanRequestHeaders(source?.headers);
+    cleanRequestHeaders(init?.headers).forEach((value, key) => headers.set(key, value));
     // Kept only in this document, just like the app's ordinary request headers.
     // Never persist authentication, signed content URLs or request traces.
-    for (const name of ['x-client-request-id', 'traceparent', 'tracestate']) headers.delete(name);
     const get = (url, signal) => fetcher(new Request(url, source || { credentials: 'include' }), {
       ...init, headers: new Headers(headers), method: 'GET', body: undefined, signal,
     });
     return {
+      // A rotated token replaces only Authorization; the list request's other headers stay as they were.
+      setAuthorization: value => { if (value) headers.set('Authorization', value); },
       verify: (id, signal) => get(new URL(`${LIST_PATH}/${encodeURIComponent(id)}/thumbnail_url`, origin), signal),
       content: (value, signal) => {
         const url = new URL(value);
         if (url.origin === origin && url.pathname === '/backend-api/estuary/content') return get(url, signal);
-        if (url.protocol !== 'https:' || !/(^|\.)(oaiusercontent\.com|openaiusercontent\.com)$/.test(url.hostname)) {
+        if (url.protocol !== 'https:' || !OPENAI_CDN_HOST.test(url.hostname)) {
           throw new Error('Unsupported reference image host');
         }
         return fetcher(url.href, { method: 'GET', credentials: 'omit', referrerPolicy: 'no-referrer', signal });
@@ -722,12 +795,47 @@ SOFTWARE.
     'mouseover', 'mouseenter', 'mousemove', 'mouseout', 'mouseleave'];
   const REFERENCE_HOVER_PROPS = ['onPointerEnter', 'onPointerLeave', 'onPointerMove', 'onPointerOver', 'onPointerOut',
     'onMouseEnter', 'onMouseLeave', 'onMouseMove', 'onMouseOver', 'onMouseOut'];
+  // Each alternative is anchored at the start of the label, excludes library navigation, and needs the
+  // "show" verb with either the "used" reference wording or an explicit count, so buttons that preview,
+  // remove, add or open the library do not match.
+  const REFERENCE_BUTTON_LABEL = new RegExp('^\\s*(?!.*(?:library|보관함|라이브러리|ライブラリ|图库|圖庫|biblioteca|biblioth[èe]que|bibliothek|библиотек))(?:' + [
+    '사용(?:된|한)\\s*(?:참고|참조)\\s*(?:자료|이미지).*(?:보기|열기)',
+    '(?:참고|참조)\\s*(?:자료|이미지)\\s*\\d+\\s*개\\s*(?:보기|열기)',
+    '(?:show|view|see)\\b(?:(?=.*\\bused\\b)|(?=.*\\b\\d+\\b)).*\\breferences?\\b',
+    'references?\\b.*\\bused\\b',
+    '(?:使用|利用)(?:した|中の)?.*(?:参照|参考)(?:資料|画像).*(?:表示|見る)',
+    '(?:显示|查看|顯示|檢視).*(?:(?:所用|使用).*|\\d+\\s*[张張個个]?\\s*)(?:参考图|参考照片|參考資料|參考圖片|參考圖)',
+    '(?:mostrar|ver)\\s+(?:(?:la|las|una|a|as|uma)\\s+)?(?:\\d+\\s+refer[êe]ncias?\\b|(?:\\d+\\s+)?refer[êe]ncias?\\s+(?:utilizad[ao]s?|usad[ao]s?)\\b)',
+    '(?:afficher|voir)\\s+(?:(?:la|les|une)\\s+)?(?:\\d+\\s+r[ée]f[ée]rences?\\b|(?:\\d+\\s+)?r[ée]f[ée]rences?\\s+utilis[ée]e?s?(?:$|[^a-zA-Z\\u00C0-\\u024F]))',
+    '(?:die\\s+)?(?:\\d+\\s+)?verwendete[ns]?\\s+(?:\\d+\\s+)?referenz(?:en)?\\b.*\\banzeigen\\b',
+    '(?:die\\s+)?\\d+\\s+referenz(?:en)?\\s+anzeigen\\b',
+    '(?:показать|посмотреть)\\s+(?:\\d+\\s+(?:использованн\\S*\\s+)?|использованн\\S*\\s+)референс',
+  ].join('|') + ')', 'i');
 
   function referenceButton(target) {
     const node = target?.nodeType === 3 ? target.parentElement : target;
     const button = typeof node?.closest === 'function' ? node.closest('button') : null;
-    return button && /^(?:사용(?:된|한)\s*(?:참고|참조)\s*(?:자료|이미지)|(?:참고|참조)\s*(?:자료|이미지).*(?:보기|열기)|(?:show|view|see)\b.*\breferences?\b|references?\b.*\bused\b)/i
-      .test(button.getAttribute('aria-label') || '') ? button : null;
+    return button && REFERENCE_BUTTON_LABEL.test(button.getAttribute('aria-label') || '') ? button : null;
+  }
+
+  function patchReactProps(element, keys, prepared, patch) {
+    let key = keys.get(element);
+    if (!key || !element[key]) {
+      key = reactKey(element, '__reactProps$');
+      if (!key) return false;
+      keys.set(element, key);
+    }
+    const props = element[key];
+    if (!props || prepared.get(element) === props) return false;
+    const next = { ...props };
+    if (!patch(props, next)) return false;
+    try {
+      element[key] = next;
+      prepared.set(element, next);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   class ReferenceClickGate {
@@ -740,23 +848,15 @@ SOFTWARE.
     prepare(button) {
       // Stop the native hover callback itself as well as event propagation.
       // Replace the DOM-side props copy, leaving React's original (possibly frozen) props untouched.
-      let key = this.keys.get(button);
-      if (!key) {
-        key = reactKey(button, '__reactProps$');
-        if (!key) return;
-        this.keys.set(button, key);
-      }
-      const props = button[key];
-      if (!props || this.prepared.get(button) === props) return;
-      const next = { ...props };
-      let changed = false;
-      for (const name of REFERENCE_HOVER_PROPS) for (const variant of [name, name + 'Capture']) {
-        if (typeof next[variant] !== 'function') continue;
-        next[variant] = this.ignoreHover; changed = true;
-      }
-      if (!changed) return;
-      try { button[key] = next; this.prepared.set(button, next); }
-      catch { /* Window capture still blocks ordinary delegated hover handlers. */ }
+      // Window capture still blocks ordinary delegated hover handlers if setting the copy fails.
+      patchReactProps(button, this.keys, this.prepared, (_props, next) => {
+        let changed = false;
+        for (const name of REFERENCE_HOVER_PROPS) for (const variant of [name, name + 'Capture']) {
+          if (typeof next[variant] !== 'function') continue;
+          next[variant] = this.ignoreHover; changed = true;
+        }
+        return changed;
+      });
     }
     handle(event) {
       if (!REFERENCE_HOVER_EVENTS.includes(event.type)) return false;
@@ -847,28 +947,20 @@ SOFTWARE.
       return this.active(menu) && !this.contains(menu, event?.relatedTarget);
     }
     prepare(menu) {
-      let key = this.keys.get(menu);
-      if (!key || !menu[key]) {
-        key = reactKey(menu, '__reactProps$');
-        if (!key) return false;
-        this.keys.set(menu, key);
-      }
-      const props = menu[key];
-      if (!props || this.prepared.get(menu) === props) return false;
-      const gate = this, next = { ...props };
-      let changed = false;
-      for (const name of ['onBlur', 'onBlurCapture']) {
-        const original = props[name];
-        if (typeof original !== 'function') continue;
-        next[name] = function (event, ...args) {
-          if (gate.keeps(menu, event)) return;
-          return original.call(this, event, ...args);
-        };
-        changed = true;
-      }
-      if (!changed) return false;
-      try { menu[key] = next; this.prepared.set(menu, next); return true; }
-      catch { return false; }
+      const gate = this;
+      return patchReactProps(menu, this.keys, this.prepared, (props, next) => {
+        let changed = false;
+        for (const name of ['onBlur', 'onBlurCapture']) {
+          const original = props[name];
+          if (typeof original !== 'function') continue;
+          next[name] = function (event, ...args) {
+            if (gate.keeps(menu, event)) return;
+            return original.call(this, event, ...args);
+          };
+          changed = true;
+        }
+        return changed;
+      });
     }
     handle(event) {
       if (event.type !== 'blur' && event.type !== 'focusout') return false;
@@ -906,11 +998,12 @@ SOFTWARE.
   function refreshGlyphPosition(text) {
     const key = ICON_FONT + ':' + text;
     if (refreshGlyphOffsets.has(key)) return refreshGlyphOffsets.get(key);
+    const host = document.body || document.documentElement;
+    let context = null;
+    try { context = document.createElement('canvas').getContext('2d'); } catch { context = null; }
+    if (!host || !context) return null;
     let probe, position = null;
     try {
-      const host = document.body || document.documentElement;
-      const context = document.createElement('canvas').getContext('2d');
-      if (!host || !context) return null;
       context.font = ICON_FONT;
       context.textAlign = 'left';
       context.textBaseline = 'alphabetic';
@@ -1024,7 +1117,7 @@ SOFTWARE.
 
   function referenceStatus({ progress, matched = 0, query = '', pages = 0, refreshing = false, caching = false, checkingCache = false,
     catalogError = false, storageError = null, storageWriteFailed = false,
-    previewProgress = null, previewCaching = false, previewPaused = false, locale = uiLocale() }) {
+    previewProgress = null, previewCaching = false, previewPaused = false, readOnly = false, locale = uiLocale() }) {
     const language = resolveUiLocale(locale);
     const number = value => Number(value || 0).toLocaleString(language);
     const t = (key, values) => translateUi(key, values, language);
@@ -1042,20 +1135,22 @@ SOFTWARE.
     if (String(query).trim()) add('search', t('searchResults'), number(matched));
     add('list', t(progress.total === null ? 'referencesUnknown' : 'referencesTotal'),
       progress.total === null ? `${number(progress.discovered)} / ?` : number(progress.total));
-    counter('database', t('thumbnailCache'), progress);
-    if (progress.pending) add('clock', t('cachePending'), number(progress.pending));
-    if (previewProgress) {
-      counter('image', t('previewCache'), previewProgress, previewCaching && !previewPaused, previewPaused);
+    if (!readOnly) {
+      counter('database', t('thumbnailCache'), progress);
+      if (progress.pending) add('clock', t('cachePending'), number(progress.pending));
+      if (previewProgress) {
+        counter('image', t('previewCache'), previewProgress, previewCaching && !previewPaused, previewPaused);
+      }
     }
     if (catalogError) add('list', t('catalogFailed'), undefined, false, true);
-    else if (refreshing || progress.total === null) add('refresh', t(refreshing ? 'catalogRefreshing' : 'catalogLoading'), undefined, true);
-    if (caching && !storageWriteFailed) add('download', t('caching'), undefined, true);
+    else if (!readOnly && (refreshing || progress.total === null)) add('refresh', t(refreshing ? 'catalogRefreshing' : 'catalogLoading'), undefined, true);
+    if (!readOnly && caching && !storageWriteFailed) add('download', t('caching'), undefined, true);
     if (checkingCache) add('verify', t('checkingCache'), undefined, true);
-    if (storageWriteFailed) add('save', t('cacheWriteError'), undefined, false, true);
+    if (!readOnly && storageWriteFailed) add('save', t('cacheWriteError'), undefined, false, true);
     else if (storageError) add('database', t('cacheError'), undefined, false, true);
     const details = tokens.map(token => token.label + (token.value === undefined ? '' : ` ${token.value}`));
-    details.push(t('catalogPages', { count: number(pages) }), t('discovered', { count: number(progress.discovered) }),
-      t('pending', { count: number(progress.pending) }));
+    details.push(t('catalogPages', { count: number(pages) }), t('discovered', { count: number(progress.discovered) }));
+    if (!readOnly) details.push(t('pending', { count: number(progress.pending) }));
     if (previewProgress) details.push(t('previewsDiscovered', { count: number(previewProgress.discovered) }),
       t('previewsPending', { count: number(previewProgress.pending) }));
     if (previewPaused) details.push(t('previewsPaused'));
@@ -1099,7 +1194,8 @@ SOFTWARE.
   function mentionImagePointers(row) {
     const pointers = props => typeof props?.assetPointer === 'string' && props.assetPointer.startsWith('sediment://') ?
       { asset_pointer: props.assetPointer,
-        thumbnail_asset_pointer: typeof props.thumbnailAssetPointer === 'string' ? props.thumbnailAssetPointer : null } : null;
+        thumbnail_asset_pointer: typeof props.thumbnailAssetPointer === 'string' && props.thumbnailAssetPointer.startsWith('sediment://') ?
+          props.thumbnailAssetPointer : null } : null;
     const host = reactFiber(row);
     const stack = host?.child ? [host.child] : [];
     for (let seen = 0; stack.length && seen < 200; seen++) {
@@ -1125,7 +1221,10 @@ SOFTWARE.
     const prefix = 'chatgpt-reference-image://';
     if (typeof href !== 'string' || !href.startsWith(prefix)) return null;
     try {
-      const [path, query = ''] = href.slice(prefix.length).split('?');
+      const raw = href.slice(prefix.length);
+      const qIndex = raw.indexOf('?');
+      const path = qIndex >= 0 ? raw.slice(0, qIndex) : raw;
+      const query = qIndex >= 0 ? raw.slice(qIndex + 1) : '';
       const id = decodeURIComponent(path).trim();
       const params = new URLSearchParams(query);
       const asset = params.get('assetPointer'), thumbnail = params.get('thumbnailAssetPointer');
@@ -1158,10 +1257,8 @@ SOFTWARE.
     constructor(lifetime = 60000, now = Date.now) { this.lifetime = lifetime; this.now = now; this.at = new Map(); }
     has(key) { const at = this.at.get(key); return at !== undefined && this.now() - at < this.lifetime; }
     add(key) { this.at.set(key, this.now()); }
-  }
-
-  function referenceOwner(id) {
-    return typeof id === 'string' ? id.match(/^(AccountUserId_[A-Za-z0-9_-]+)~/)?.[1] || null : null;
+    delete(key) { this.at.delete(key); }
+    clear() { this.at.clear(); }
   }
 
   function mentionHighlighted(row) {
@@ -1176,6 +1273,25 @@ SOFTWARE.
     return null;
   }
 
+  function rowFiberInfo(row) {
+    let referenceId = null;
+    for (let fiber = reactFiber(row), depth = 0; fiber && depth < FIBER_DEPTH; depth += 1, fiber = fiber.return) {
+      if (!referenceId && typeof fiber.key === 'string' && /^AccountUserId_[\w-]+~refimage_/.test(fiber.key)) {
+        referenceId = fiber.key;
+      }
+      const props = referenceProvider(fiber);
+      if (props) return { fiber, props, referenceId };
+    }
+    return { fiber: null, props: null, referenceId };
+  }
+
+  function isLibraryMenuItem(row) {
+    const { props, referenceId } = rowFiberInfo(row);
+    if (!props) return true;
+    if (!referenceId) return false;
+    return !props.items.some(item => item.reference_image_id === referenceId);
+  }
+
   function nativeCatalog(node, accountId) {
     for (let fiber = reactFiber(node), depth = 0; fiber && depth < FIBER_DEPTH; fiber = fiber.return, depth++) {
       const props = referenceProvider(fiber);
@@ -1186,22 +1302,16 @@ SOFTWARE.
   }
 
   function nativeSelection(row, accountId) {
-    let referenceId = null;
-    for (let fiber = reactFiber(row), depth = 0; fiber && depth < FIBER_DEPTH; depth += 1, fiber = fiber.return) {
-      if (!referenceId && typeof fiber.key === 'string' && /^AccountUserId_[\w-]+~refimage_/.test(fiber.key)) referenceId = fiber.key;
-      const props = referenceProvider(fiber);
-      if (!props) continue;
-      if (!referenceId || props.items.some(item => item.reference_image_id === referenceId)) return null; // Edit entries keep the native flow.
-      const found = referenceQuery(fiber, props, accountId);
-      if (!found) return null;
-      const { query, scope } = found;
-      const current = Array.isArray(query.state.data) ? query.state.data : [];
-      const placeholder = Array.isArray(query.options.placeholderData) ? query.options.placeholderData : [];
-      const reference = cleanReference(current.find(item => item.id === referenceId) || placeholder.find(item => item.id === referenceId));
-      if (!reference?.asset_pointer) return null;
-      return { reference, query, scope, cacheKey: props.cacheKey, onRecreate: props.onRecreate, placeholder };
-    }
-    return null;
+    const { fiber, props, referenceId } = rowFiberInfo(row);
+    if (!props || !referenceId || props.items.some(item => item.reference_image_id === referenceId)) return null; // Edit entries keep the native flow.
+    const found = referenceQuery(fiber, props, accountId);
+    if (!found) return null;
+    const { query, scope } = found;
+    const current = Array.isArray(query.state.data) ? query.state.data : [];
+    const placeholder = Array.isArray(query.options.placeholderData) ? query.options.placeholderData : [];
+    const reference = cleanReference(current.find(item => item.id === referenceId) || placeholder.find(item => item.id === referenceId));
+    if (!reference?.asset_pointer) return null;
+    return { reference, query, scope, cacheKey: props.cacheKey, onRecreate: props.onRecreate, placeholder };
   }
 
   async function boundedImage(download, milliseconds, parentSignal) {
@@ -1242,16 +1352,17 @@ SOFTWARE.
       this.backgroundLimit = backgroundLimit;
       this.active = 0;
       this.activeBackground = 0;
-      this.jobs = [];
+      this.queued = new Set();
     }
+
+    get size() { return this.queued.size; }
+    get jobs() { return [...this.queued]; }
 
     run(task, signal, foreground = () => true) {
       return new Promise((resolve, reject) => {
         const job = { task, signal, resolve, reject, foreground };
         const cancel = () => {
-          const index = this.jobs.indexOf(job);
-          if (index >= 0) {
-            this.jobs.splice(index, 1);
+          if (this.queued.delete(job)) {
             job.cleanup();
             reject(new DOMException('Request cancelled', 'AbortError'));
           }
@@ -1262,25 +1373,34 @@ SOFTWARE.
           return;
         }
         signal?.addEventListener('abort', cancel, { once: true });
-        this.jobs.push(job);
+        this.queued.add(job);
         this.drain();
       });
     }
 
     drain() {
-      while (this.active < this.limit && this.jobs.length) {
-        const foregroundIndex = this.jobs.findIndex(job => job.foreground());
-        if (foregroundIndex < 0 && this.activeBackground >= this.backgroundLimit) break;
-        const job = this.jobs.splice(foregroundIndex < 0 ? 0 : foregroundIndex, 1)[0];
-        job.cleanup();
-        if (job.signal?.aborted) {
-          job.reject(new DOMException('Request cancelled', 'AbortError'));
+      while (this.active < this.limit && this.queued.size) {
+        let picked = null, foreground = false;
+        for (const job of this.queued) {
+          if (job.foreground()) {
+            picked = job;
+            foreground = true;
+            break;
+          }
+          if (!picked) picked = job;
+        }
+        if (!picked) break;
+        if (!foreground && this.activeBackground >= this.backgroundLimit) break;
+        this.queued.delete(picked);
+        picked.cleanup();
+        if (picked.signal?.aborted) {
+          picked.reject(new DOMException('Request cancelled', 'AbortError'));
           continue;
         }
-        const background = !job.foreground();
+        const background = !foreground;
         this.active += 1;
         if (background) this.activeBackground += 1;
-        Promise.resolve().then(job.task).then(job.resolve, job.reject).finally(() => {
+        Promise.resolve().then(picked.task).then(picked.resolve, picked.reject).finally(() => {
           this.active -= 1;
           if (background) this.activeBackground -= 1;
           this.drain();
@@ -1392,7 +1512,7 @@ SOFTWARE.
       cache.onReady = record => this.confirm(record);
     }
     current(entry) { return entry.transport.scope === this.scope() && this.references.get(entry.reference.id) === entry; }
-    register(scope, reference, transport) {
+    register(scope, reference, transport, retrySet = null) {
       if (scope !== this.scope()) return;
       const key = previewKey(scope, reference), old = this.references.get(reference.id);
       this.inventory.register([reference]);
@@ -1401,7 +1521,15 @@ SOFTWARE.
         const entry = { key, reference, transport, signature: previewKey('', reference) };
         this.references.set(reference.id, entry); this.cache.protectedKeys.add(key);
       } else { old.reference = reference; old.transport = transport; }
-      if (!this.paused && this.inventory.items.get(reference.id)?.status === 'pending') this.ensure(this.references.get(reference.id));
+      const entry = this.references.get(reference.id), item = this.inventory.items.get(reference.id);
+      if (retrySet && !retrySet.has(key)) {
+        retrySet.add(key);
+        const writePaused = this.paused && this.paused.cacheStorageOperation !== 'read';
+        if (!writePaused && item?.file && !this.storageFailed.has(entry.key) && item.status === 'failed') {
+          this.inventory.mark(entry.signature, 'pending');
+        }
+      }
+      if (!this.paused && this.inventory.items.get(reference.id)?.status === 'pending') this.ensure(entry);
       this.changed();
     }
     finish(scope, references) {
@@ -1535,6 +1663,9 @@ SOFTWARE.
       Object.assign(this, { storage, start, cancel, changed });
       this.chatId = null; this.enabled = false; this.running = false;
       this.context = null; this.controller = null; this.pageActive = true; this.storageError = false; this.fallback = null;
+      // Chat and credentials key whose start failed. Requests made by the app do not retry it;
+      // the next menu open (begin), another chat or another account does.
+      this.failedStart = null;
     }
     normalize(ids) {
       return [...new Set(ids.filter(id => typeof id === 'string' && /^[a-zA-Z0-9_-]+$/.test(id)))].slice(0, CONFIG.resumeChats);
@@ -1580,17 +1711,19 @@ SOFTWARE.
     route(value) {
       const id = chatIdFor(value);
       if (id === this.chatId) return;
+      this.failedStart = null;
       this.suspend(); this.chatId = id; this.enabled = Boolean(id && this.read(id));
       this.resume(); this.changed();
     }
     credentials(context) {
       const changed = this.context?.key !== context?.key;
-      if (changed) this.suspend();
+      if (changed) { this.failedStart = null; this.suspend(); }
       this.context = context;
       this.resume(); this.changed();
     }
     begin() {
       if (!this.chatId) return;
+      this.failedStart = null;
       this.write(this.chatId, true); this.enabled = true; this.resume(); this.changed();
     }
     stop() {
@@ -1617,15 +1750,29 @@ SOFTWARE.
     }
     resume() {
       if (!this.pageActive || !this.chatId || !this.enabled || !this.context || this.running) return;
+      const attempt = { chatId: this.chatId, key: this.context.key, auth: this.context.authorization ?? null };
+      if (this.failedStart && this.failedStart.chatId === attempt.chatId &&
+          this.failedStart.key === attempt.key && this.failedStart.auth === attempt.auth) return;
       const controller = new AbortController(); this.controller = controller; this.running = true;
       Promise.resolve().then(() => {
         if (!controller.signal.aborted && this.controller === controller) return this.start(this.context, controller.signal);
-      }).catch(() => { /* Startup failure leaves caching idle until the next open or route. */ }).finally(() => this.changed());
+      }).then(() => {
+        if (this.controller === controller) this.failedStart = null;
+      }, () => {
+        // Startup failure leaves caching idle until the next open, token rotation, chat or account.
+        if (this.controller === controller) { this.running = false; this.controller = null; this.failedStart = attempt; }
+      }).finally(() => this.changed());
     }
   }
 
+  function conversationIdFromPath(pathname) {
+    return typeof pathname === 'string'
+      ? pathname.match(/^\/backend-api\/conversation\/([a-zA-Z0-9_-]+)\/?$/)?.[1] || null
+      : null;
+  }
+
   async function deletedChatId(url, method, input, init) {
-    const id = url.pathname.match(/^\/backend-api\/conversation\/([a-zA-Z0-9_-]+)\/?$/)?.[1];
+    const id = conversationIdFromPath(url.pathname);
     if (!id) return null;
     if (method === 'DELETE') return id;
     if (method !== 'PATCH') return null;
@@ -1642,39 +1789,53 @@ SOFTWARE.
       this.pending = new Map(); this.written = new Map(); this.timer = null; this.flushing = null; this.generation = 0;
     }
     prime(key, at) { this.written.set(key, at || 0); }
+    schedule() {
+      if (this.timer !== null) return;
+      this.timer = setTimeout(() => { void this.flush(); }, this.delay);
+      this.timer?.unref?.();
+    }
     touch(key, at = Date.now()) {
       if (at - (this.written.get(key) || 0) < this.interval) return;
       this.pending.set(key, Math.max(at, this.pending.get(key) || 0));
       if (this.pending.size >= this.size) { void this.flush(); return; }
-      if (this.timer === null) this.timer = setTimeout(() => { void this.flush(); }, this.delay);
+      this.schedule();
     }
     flush() {
       clearTimeout(this.timer); this.timer = null;
-      if (this.flushing) return this.flushing;
       for (const [key, at] of this.pending) if (at - (this.written.get(key) || 0) < this.interval) this.pending.delete(key);
-      if (!this.pending.size) return Promise.resolve();
+      if (!this.pending.size) return this.flushing || Promise.resolve();
       const batch = this.pending; this.pending = new Map();
       const generation = this.generation;
-      this.flushing = Promise.resolve().then(() => this.write(batch)).then(() => {
+      const run = () => Promise.resolve().then(() => this.write(batch)).then(() => {
         if (generation === this.generation) for (const [key, at] of batch) this.written.set(key, at);
-      }).catch(() => {}).finally(() => {
-        this.flushing = null;
-        if (this.pending.size && this.timer === null) this.timer = setTimeout(() => { void this.flush(); }, this.delay);
+      }).catch(() => {});
+      const current = (this.flushing ? this.flushing.then(run, run) : run()).finally(() => {
+        if (this.flushing === current) {
+          this.flushing = null;
+          if (this.pending.size && this.timer === null) this.schedule();
+        }
       });
-      return this.flushing;
+      this.flushing = current;
+      return current;
     }
     clear() { this.generation++; clearTimeout(this.timer); this.timer = null; this.pending.clear(); this.written.clear(); }
   }
 
   class MenuRows {
-    constructor(index, readLabels) { this.index = index; this.readLabels = readLabels; }
+    constructor(index, readLabels, readId = () => null) { this.index = index; this.readLabels = readLabels; this.readId = readId; }
     init(state) {
       Object.assign(state, { rows: [], filteredRows: [], references: new Map(), rowsByFile: new Map(),
-        details: new Map(), rowsByLabel: new Map(), dirtyNames: new Set(), dirtyRows: new Set(), query: null });
+        readOnlyRefs: new Map(), readOnlyByFile: new Map(), lastItemCount: 0,
+        details: new Map(), rowsById: new Map(), rowsByLabel: new Map(), dirtyIds: new Set(), dirtyNames: new Set(), dirtyRows: new Set(), query: null });
     }
+    isManaged(state, row) { return Boolean(state?.details?.has(row)); }
     attach(state, row) {
       const labels = this.readLabels(row);
-      state.details.set(row, { labels, fallback: row.getAttribute('aria-label') || row.textContent, normalized: null });
+      const id = this.readId(row) || null;
+      state.details.set(row, { id, labels, fallback: row.getAttribute('aria-label') || row.textContent, normalized: null });
+      if (id) {
+        const bucket = state.rowsById?.get(id) || new Set(); bucket.add(row); state.rowsById?.set(id, bucket);
+      }
       for (const label of labels) {
         const bucket = state.rowsByLabel.get(label) || new Set(); bucket.add(row); state.rowsByLabel.set(label, bucket);
       }
@@ -1683,6 +1844,10 @@ SOFTWARE.
     detach(state, row) {
       const detail = state.details.get(row);
       if (!detail) return;
+      if (detail.id) {
+        const rows = state.rowsById?.get(detail.id); rows?.delete(row);
+        if (!rows?.size) state.rowsById?.delete(detail.id);
+      }
       for (const label of detail.labels) {
         const rows = state.rowsByLabel.get(label); rows?.delete(row);
         if (!rows?.size) state.rowsByLabel.delete(label);
@@ -1700,7 +1865,8 @@ SOFTWARE.
     }
     bind(state, row) {
       const detail = state.details.get(row);
-      const ref = detail.labels.map(label => this.index.byName.get(label)).find(refs => refs?.length === 1)?.[0] || null;
+      const ref = (detail.id ? this.index.byId.get(detail.id) : null) ||
+        detail.labels.map(label => this.index.byName.get(label)).find(refs => refs?.length === 1)?.[0] || null;
       const previous = state.references.get(row) || null;
       if (previous === ref && detail.normalized !== null) return false;
       this.unbind(state, row);
@@ -1723,11 +1889,13 @@ SOFTWARE.
       }
       let changed = !same;
       const affected = new Set(state.dirtyRows);
+      for (const id of state.dirtyIds || []) for (const row of state.rowsById?.get(id) || []) affected.add(row);
       for (const name of state.dirtyNames) for (const row of state.rowsByLabel.get(name) || []) affected.add(row);
       for (const row of affected) if (state.details.has(row)) {
         this.detach(state, row); this.attach(state, row); changed = true;
       }
       state.dirtyRows.clear();
+      state.dirtyIds?.clear();
       state.dirtyNames.clear();
       return changed;
     }
@@ -1748,13 +1916,29 @@ SOFTWARE.
       let low = 0, high = rows.length;
       while (low < high) {
         const middle = (low + high) >>> 1;
-        if (rows[middle].getBoundingClientRect().bottom <= top) low = middle + 1; else high = middle;
+        const rect = rows[middle].getBoundingClientRect();
+        if (rect.height > 0) {
+          if (rect.bottom <= top) low = middle + 1; else high = middle;
+          continue;
+        }
+        let probe = middle + 1, probeRect = null;
+        while (probe < high) {
+          const candidate = rows[probe].getBoundingClientRect();
+          if (candidate.height > 0) { probeRect = candidate; break; }
+          probe++;
+        }
+        if (probeRect) {
+          if (probeRect.bottom <= top) low = probe + 1; else high = middle;
+        } else {
+          high = middle;
+        }
       }
       const result = [];
       for (let i = low; i < rows.length; i++) {
         const rect = rows[i].getBoundingClientRect();
+        if (rect.height <= 0) continue;
         if (rect.top >= bottom) break;
-        if (rect.height > 0 && rect.bottom > top) result.push(rows[i]);
+        if (rect.bottom > top) result.push(rows[i]);
       }
       return result;
     }
@@ -1820,8 +2004,8 @@ SOFTWARE.
   }
 
   class CatalogSession {
-    constructor({ owner, request, onPage, onComplete, timeout = 30000 }) {
-      Object.assign(this, { owner, request, onPage, onComplete, timeout });
+    constructor({ owner, provisional = false, onOwner = null, request, onPage, onComplete, timeout = 30000 }) {
+      Object.assign(this, { owner, provisional, onOwner, request, onPage, onComplete, timeout });
       this.controller = new AbortController();
       this.requests = new Map();
       this.pages = new Map();
@@ -1830,9 +2014,19 @@ SOFTWARE.
     async accept(cursor, body) {
       this.controller.signal.throwIfAborted();
       const items = Array.isArray(body?.items) ? body.items.map(cleanReference) : null;
-      if (!items || items.some(item => !item) || (items.length && this.owner && verifiedOwner(items) !== this.owner) ||
-          (body.next_cursor != null && typeof body.next_cursor !== 'string')) {
+      const pageOwner = items?.length ? verifiedOwner(items) : null;
+      if (!items || items.some(item => !item) || (body.next_cursor != null && typeof body.next_cursor !== 'string') ||
+          (items.length && (this.owner || this.provisional) && !pageOwner)) {
         const error = new Error('Invalid reference catalog page'); error.retryable = false; throw error;
+      }
+      if (items.length && pageOwner) {
+        if (this.provisional) {
+          this.provisional = false;
+          this.owner = pageOwner;
+          this.onOwner?.(pageOwner);
+        } else if (this.owner && pageOwner !== this.owner) {
+          const error = new Error('Invalid reference catalog page'); error.retryable = false; throw error;
+        }
       }
       const page = { items, next_cursor: body.next_cursor ?? null };
       this.pages.set(cursor, { cursor, ...page });
@@ -1966,6 +2160,7 @@ SOFTWARE.
       this.disk = { limit: diskLimit, maxBytes: diskMaxBytes, maxEntryBytes: Math.min(this.memory.maxBytes, diskMaxBytes),
         lifetime: this.memory.lifetime, now: this.memory.now };
       this.reads = new Map();
+      this.writes = new Map();
       this.invalidated = new Set();
       this.versions = new Map();
       this.generation = 0;
@@ -1998,7 +2193,19 @@ SOFTWARE.
       if (!scope || scope !== this.scope() || this.invalidated.has(key)) return null;
       const cached = this.memory.get(key);
       if (cached) { this.accessWrites.touch(key, this.memory.now()); return cached; }
-      const generation = this.generation, version = this.versions.get(key) || 0;
+      const generation = this.generation;
+      while (this.writes.has(key)) {
+        const write = this.writes.get(key);
+        const prepared = write.record ? { record: write.record, version: write.version } :
+          await waitWithSignal(write.ready, signal).catch(error => {
+            if (signal?.aborted && error?.name === 'AbortError') throw error;
+            return null;
+          });
+        if (generation !== this.generation || scope !== this.scope() || this.invalidated.has(key)) return null;
+        if (prepared && prepared.version === (this.versions.get(key) || 0)) return this.remember(prepared.record);
+        if (this.writes.get(key) === write) break;
+      }
+      const version = this.versions.get(key) || 0;
       const loaded = await this.read(key, signal).catch(error => { if (error?.name === 'AbortError') throw error; return null; });
       if (!loaded || generation !== this.generation || version !== (this.versions.get(key) || 0)) return null;
       return this.remember(loaded.record);
@@ -2044,9 +2251,14 @@ SOFTWARE.
     }
     async put(key, blob, savedAt = this.memory.now(), signal) {
       const { record, version } = await this.prepare(key, blob, savedAt, signal);
-      const url = this.remember(record);
-      this.persist(record, version);
-      return url;
+      try {
+        const url = this.remember(record);
+        this.persist(record, version);
+        return url;
+      } catch (error) {
+        if (this.writes.get(key)?.version === version) this.writes.delete(key);
+        throw error;
+      }
     }
     async store(key, blob, signal) {
       const { record, version } = await this.prepare(key, blob, this.memory.now(), signal);
@@ -2058,16 +2270,25 @@ SOFTWARE.
       if (!scope || scope !== this.scope() || !(blob instanceof Blob) || !/^image\//i.test(blob.type) || !blob.size) throw new Error('Invalid large preview');
       const version = (this.versions.get(key) || 0) + 1;
       this.versions.set(key, version);
-      const resized = await this.resize(blob);
-      signal?.throwIfAborted();
-      if (generation !== this.generation || scope !== this.scope() || version !== this.versions.get(key)) {
-        throw new DOMException('Preview superseded', 'AbortError');
-      }
-      const record = { key, scope, savedAt, accessedAt: savedAt, ...resized, processing: PREVIEW_PROCESSING };
-      if (!scope || scope !== this.scope() || !validPreview(record, this.disk)) throw new Error('Invalid large preview');
-      if (!processedPreview(record)) throw new Error('Invalid resized preview');
-      this.invalidated.delete(key);
-      return { record, version };
+      const write = { version, record: null, ready: null };
+      this.writes.set(key, write);
+      write.ready = (async () => {
+        const resized = await this.resize(blob);
+        signal?.throwIfAborted();
+        if (generation !== this.generation || scope !== this.scope() || version !== this.versions.get(key)) {
+          throw new DOMException('Preview superseded', 'AbortError');
+        }
+        const record = { key, scope, savedAt, accessedAt: savedAt, ...resized, processing: PREVIEW_PROCESSING };
+        if (!scope || scope !== this.scope() || !validPreview(record, this.disk)) throw new Error('Invalid large preview');
+        if (!processedPreview(record)) throw new Error('Invalid resized preview');
+        this.invalidated.delete(key);
+        write.record = record;
+        return { record, version };
+      })();
+      write.ready.catch(() => {
+        if (this.writes.get(key) === write) this.writes.delete(key);
+      });
+      return write.ready;
     }
     persist(record, version, background = false) {
       const generation = this.generation;
@@ -2077,14 +2298,20 @@ SOFTWARE.
         catch (error) { error.cacheStorageFailure = true; error.cacheStorageOperation = 'write'; throw error; }
         if (generation === this.generation && (this.versions.get(record.key) || 0) === version) this.onReady(record);
         // Maintenance failure is reported by Storage, but the image commit succeeded.
-        if (!background || !this.protectedKeys.has(record.key) || ++this.backgroundWrites % 32 === 0) await this.prune().catch(() => {});
+        if (!background || !this.protectedKeys.has(record.key) || (this.protectionReady && ++this.backgroundWrites % 32 === 0)) {
+          const cleanup = this.prune === PersistentPreviewCache.prototype.prune ? () => this.pruneNow() : () => this.prune();
+          await cleanup().catch(() => {});
+        }
         return true;
+      }).finally(() => {
+        if (this.writes.get(record.key)?.version === version) this.writes.delete(record.key);
       });
       committed.catch(() => {});
       return committed;
     }
     delete(key) {
       this.memory.delete(key);
+      this.writes.delete(key);
       this.versions.set(key, (this.versions.get(key) || 0) + 1);
       this.invalidated.add(key);
       this.onRemoved([key]);
@@ -2094,9 +2321,11 @@ SOFTWARE.
       this.generation++;
       this.memory.clear();
       this.reads.clear();
+      this.writes.clear();
       void this.accessWrites.flush();
+      this.accessWrites.clear();
     }
-    prune() {
+    pruneNow() {
       const removed = [];
       return this.storage.request('previews', 'readwrite', table => {
         const request = table.getAll();
@@ -2116,6 +2345,9 @@ SOFTWARE.
           }
         };
       }).then(() => { if (removed.length) this.onRemoved(removed); return removed; });
+    }
+    prune() {
+      return this.enqueue(() => this.pruneNow());
     }
   }
 
@@ -2151,7 +2383,12 @@ SOFTWARE.
         }
         if (this.valid(target)) display('ready', url);
       } catch (error) {
-        if (this.valid(target) && error.name !== 'AbortError') display('error');
+        if (error?.name !== 'AbortError') { if (this.valid(target)) display('error'); return; }
+        // A store "superseded" by another writer of the same preview: show what that writer stored.
+        const stored = this.valid(target) && !target.context?.stored ?
+          await Promise.resolve().then(() => this.cache.get(target.key, target.controller.signal)).catch(() => null) : null;
+        if (stored && this.valid(target)) display('ready', stored);
+        else if (this.target === target) this.close();
       }
     }
     close() {
@@ -2193,8 +2430,8 @@ SOFTWARE.
     };
   }
 
-  if (typeof module === 'object' && module.exports) {
-    module.exports = { CONFIG, UI_MESSAGES, UI_ICONS, ReferenceFocusGate, renderUiStatus, glyphPosition, resolveUiLocale, uiLocale, translateUi, matchesSearch, searchWords, fileKey, contentKey, scopeKey, verifiedOwner, cleanReference, fresh, validThumbnail, catalogBody, detachedDownload, boundedImage, thumbnailMatchesReference, referenceTransport, mergeReference, nativeSelection, nativeCatalog, referenceButton, referenceStatus, referenceNotice, referenceRefreshState, ReferenceClickGate, REFERENCE_HOVER_EVENTS, mentionReferenceId, mentionHighlighted, highlightedMention, mentionImagePointers, referenceOwner, mentionIconBox, referencePill, RecentMisses, ReferenceIndex, DownloadQueue, ThumbnailInventory, SharedImages, PreviewLoader, ChatCacheSession, chatIdFor, deletedChatId, CHAT_CACHE_PREFIX, CHAT_CACHE_RECENT_KEY, AccessWriteBatch, MenuRows, CatalogSession, waitWithSignal, PreviewCache, PersistentPreviewCache, HoverPreview, resizePreview, previewImageSize, previewPosition };
+  if (typeof window === 'undefined' && typeof module === 'object' && module !== null && module.exports) {
+    module.exports = { CONFIG, UI_MESSAGES, UI_ICONS, ReferenceFocusGate, renderUiStatus, glyphPosition, resolveUiLocale, uiLocale, translateUi, matchesSearch, searchWords, fileKey, pointerFileHex, contentKey, scopeKey, scopeOwner, verifiedOwner, cleanReference, fresh, validThumbnail, catalogBody, createCatalogSnapshot, detachedDownload, boundedImage, thumbnailMatchesReference, menuAvatarRequest, cleanRequestHeaders, referenceTransport, mergeReference, rowFiberInfo, isLibraryMenuItem, nativeSelection, nativeCatalog, referenceButton, referenceStatus, referenceNotice, referenceRefreshState, ReferenceClickGate, patchReactProps, REFERENCE_HOVER_EVENTS, mentionReferenceId, mentionHighlighted, highlightedMention, mentionImagePointers, referenceOwner, mentionIconBox, referencePill, RecentMisses, ReferenceIndex, DownloadQueue, ThumbnailInventory, SharedImages, PreviewLoader, ChatCacheSession, chatIdFor, conversationIdFromPath, deletedChatId, CHAT_CACHE_PREFIX, CHAT_CACHE_RECENT_KEY, AccessWriteBatch, MenuRows, CatalogSession, waitWithSignal, PreviewCache, PersistentPreviewCache, HoverPreview, resizePreview, previewImageSize, previewPosition };
     return;
   }
   if (window.top !== window || window.__referenceMenuFastInstalled) return;
@@ -2348,7 +2585,7 @@ SOFTWARE.
         if (this.finishOperation(operation, sequence, error) && mode === 'readonly' && retryRead) {
           // Recheck the exact failed read once, independently of the server fallback.
           // Never replay writes or retry indefinitely while storage remains unavailable.
-          this.retries.set(operation, setTimeout(() => {
+          const retry = setTimeout(() => {
             this.retries.delete(operation);
             if (this.errors.get(operation)?.sequence === sequence) {
               this.readChecks.add(sequence);
@@ -2358,7 +2595,9 @@ SOFTWARE.
                 updateProgress();
               });
             }
-          }, CONFIG.storageReadRetryMs));
+          }, CONFIG.storageReadRetryMs);
+          retry?.unref?.();
+          this.retries.set(operation, retry);
         }
         throw error;
       }
@@ -2368,23 +2607,25 @@ SOFTWARE.
     put(store, value) { return this.request(store, 'readwrite', table => table.put(value)); }
     delete(store, key) { return this.request(store, 'readwrite', table => table.delete(key)); }
 
-    async prune(protectedKeys = new Set()) {
+    async prune(protectedKeys = new Set(), maxThumbnails = CONFIG.maxThumbnails) {
       const removed = [];
       await this.request('thumbnails', 'readwrite', table => {
-        const count = table.count();
-        count.onsuccess = () => {
-          let extra = Math.max(0, count.result - Math.max(CONFIG.maxThumbnails, protectedKeys.size));
-          const cursor = table.index('accessedAt').openCursor();
-          cursor.onsuccess = () => {
-            const row = cursor.result;
-            if (!row) return;
-            if (!fresh(row.value, THUMBNAIL_LIFETIME) || (extra > 0 && !protectedKeys.has(row.value.key))) {
-              removed.push(row.value.key);
-              row.delete();
-              extra = Math.max(0, extra - 1);
-            }
-            row.continue();
-          };
+        const request = table.getAll();
+        request.onsuccess = () => {
+          const valid = [];
+          for (const record of request.result || []) {
+            if (usableThumbnail(record)) valid.push(record);
+            else { removed.push(record.key); table.delete(record.key); }
+          }
+          valid.sort((a, b) => (a.accessedAt || a.savedAt) - (b.accessedAt || b.savedAt));
+          let extra = Math.max(0, valid.length - Math.max(maxThumbnails, protectedKeys.size));
+          for (const record of valid) {
+            if (extra <= 0) break;
+            if (protectedKeys.has(record.key)) continue;
+            removed.push(record.key);
+            table.delete(record.key);
+            extra--;
+          }
         };
       });
       return removed;
@@ -2405,27 +2646,33 @@ SOFTWARE.
     indexReferences(items, complete) {
       const changes = this.index.apply(items, complete);
       if (!changes.changed) return;
-      for (const state of mountedMenus.values()) if (state.dirtyNames) for (const name of changes.names) state.dirtyNames.add(name);
+      for (const state of mountedMenus.values()) {
+        if (state.dirtyIds) for (const id of changes.ids) state.dirtyIds.add(id);
+        if (state.dirtyNames) for (const name of changes.names) state.dirtyNames.add(name);
+      }
       schedule();
     }
 
     clearReferenceIndex() {
-      for (const state of mountedMenus.values()) if (state.dirtyNames) for (const name of referencesByName.keys()) state.dirtyNames.add(name);
+      for (const state of mountedMenus.values()) {
+        if (state.dirtyIds) for (const id of referencesById.keys()) state.dirtyIds.add(id);
+        if (state.dirtyNames) for (const name of referencesByName.keys()) state.dirtyNames.add(name);
+      }
       this.index.clear();
       schedule();
     }
 
-    registerReferences(scope, items, complete = false) {
+    registerReferences(scope, items, complete = false, retrySet = null) {
       if (activeScope !== scope) return;
       inventory.register(items);
       this.indexReferences(items, complete);
       if (complete) inventory.finish(items);
-      this.cacheReferences(scope, items);
+      this.cacheReferences(scope, items, retrySet);
       if (complete && cacheAllowed()) previewLoader.finish(scope, items);
       updateProgress();
     }
 
-    cacheReferences(scope, items) {
+    cacheReferences(scope, items, retrySet = null) {
       if (!cacheAllowed()) return;
       if (activeScope !== scope) return;
       const transport = activeTransport;
@@ -2434,23 +2681,29 @@ SOFTWARE.
         const file = referenceFile(reference);
         if (!file) continue;
         referenceSources.set(file, { reference, transport });
-        if (processed.has(file)) { previewLoader.register(scope, reference, transport); continue; }
+        if (processed.has(file)) { previewLoader.register(scope, reference, transport, retrySet); continue; }
         processed.add(file);
         const key = JSON.stringify([scope, file]);
+        if (retrySet && !retrySet.has(key)) {
+          retrySet.add(key);
+          if (!storageWriteFailed && !thumbnailLoader.storageFailed.has(key)) thumbnailFailed.delete(key);
+        }
         const cached = thumbnailMemory.get(key);
         if (cached?.persisted && usableThumbnail(cached)) {
           thumbnailCompleted.add(key);
           inventory.mark(file, 'ready');
         } else if (thumbnailFailed.has(key)) inventory.mark(file, 'failed');
         else queueThumbnail(scope, file, signal => downloadReference(reference, transport, signal));
-        previewLoader.register(scope, reference, transport);
+        previewLoader.register(scope, reference, transport, retrySet);
       }
       updateProgress();
     }
 
-    startCatalogSession(transport, firstPage, { preserveSnapshot = false, restart = false } = {}) {
+    startCatalogSession(transport, firstPage, { preserveSnapshot = false, restart = false, provisional = false } = {}) {
       if (!cacheAllowed()) return null;
-      const existing = this.sessions.get(transport.scope);
+      let scope = transport.scope;
+      const [, accountKey] = JSON.parse(scope);
+      const existing = this.sessions.get(scope);
       if (!restart && !firstPage && sessionRunning(existing)) return existing;
       existing?.controller.abort();
       if (!preserveSnapshot) {
@@ -2461,35 +2714,57 @@ SOFTWARE.
         this.clearReferenceIndex();
       }
       catalogError = false;
+      const retrySet = restart || !preserveSnapshot ? new Set() : null;
       const session = new CatalogSession({
-        owner: JSON.parse(transport.scope)[0], request: (cursor, signal) => transport.api.list(cursor, signal),
+        owner: JSON.parse(scope)[0],
+        provisional: provisional || Boolean(transport.provisional),
+        onOwner: nextOwner => {
+          transport.provisional = false;
+          const nextScope = scopeKey(nextOwner, accountKey);
+          if (!nextScope || nextScope === scope) return;
+          const oldScope = scope;
+          scope = nextScope;
+          if (transport === activeTransport || transport.scope === oldScope) transport.scope = nextScope;
+          this.sessions.delete(oldScope);
+          this.collectedSessions.delete(oldScope);
+          this.records.delete(oldScope);
+          safely(storage.delete('catalogs', oldScope));
+          if (activeScope === oldScope) {
+            const promotingTransport = activeTransport;
+            setScope(nextScope);
+            activeTransport = promotingTransport;
+          }
+          this.sessions.set(nextScope, session);
+          this.collectedSessions.set(nextScope, session);
+        },
+        request: (cursor, signal) => transport.api.list(cursor, signal),
         timeout: CONFIG.requestTimeoutSeconds * 1000,
-        onPage: items => preserveSnapshot ? this.cacheReferences(transport.scope, items) : this.registerReferences(transport.scope, items),
+        onPage: items => preserveSnapshot ? this.cacheReferences(scope, items, retrySet) : this.registerReferences(scope, items, false, retrySet),
         onComplete: async pages => {
           session.controller.signal.throwIfAborted();
-          if (activeScope !== transport.scope) return;
-          const record = { key: transport.scope, savedAt: Date.now(), pages,
-            identity: transport.identity ?? this.records.get(transport.scope)?.identity ?? null };
-          this.records.set(transport.scope, record);
+          if (activeScope !== scope) return;
+          const record = { key: scope, savedAt: Date.now(), pages,
+            identity: transport.identity ?? this.records.get(scope)?.identity ?? null };
+          this.records.set(scope, record);
           // Metadata is complete when the final page arrives, independently of disk persistence.
           this.indexed = record;
-          this.registerReferences(transport.scope, pages.flatMap(page => page.items), true);
-          if (preserveSnapshot || restart) this.publish(record, transport.scope);
+          this.registerReferences(scope, pages.flatMap(page => page.items), true, retrySet);
+          if (preserveSnapshot || restart) this.publish(record, scope);
           safely(storage.request('catalogs', 'readwrite', table => {
-            if (!session.controller.signal.aborted && activeScope === transport.scope) return table.put(record);
+            if (!session.controller.signal.aborted && activeScope === scope) return table.put(record);
           }));
         },
       });
       session.servingSnapshot = preserveSnapshot;
       // Native menu requests waiting on the cancelled session follow this replacement.
       if (restart && existing) existing.replacement = session;
-      this.sessions.set(transport.scope, session);
-      this.collectedSessions.set(transport.scope, session);
+      this.sessions.set(scope, session);
+      this.collectedSessions.set(scope, session);
       updateProgress();
       if (firstPage) safely(session.prime(null, firstPage));
       safely(session.start().catch(() => {
         session.failed = true;
-        if (activeScope === transport.scope && this.sessions.get(transport.scope) === session && !session.controller.signal.aborted) catalogError = true;
+        if (activeScope === scope && this.sessions.get(scope) === session && !session.controller.signal.aborted) catalogError = true;
       }).finally(() => { updateProgress(); }));
       return session;
     }
@@ -2529,7 +2804,7 @@ SOFTWARE.
       // Opening this chat's reference menu replaces the removed start button.
       if (cacheSession.chatId) cacheSession.begin();
       const scope = activeScope, transport = activeTransport, epoch = catalogEpoch;
-      if (!cacheAllowed() || !scope || transport?.scope !== scope || !this.indexed) return;
+      if (!cacheAllowed() || !scope || transport?.scope !== scope || catalogBarrier) return;
       // The app can reopen its own query cache without issuing another fetch.
       queueMicrotask(() => {
         if (activeScope !== scope || catalogEpoch !== epoch) return;
@@ -2576,15 +2851,7 @@ SOFTWARE.
     }
 
     async invalidate(scope) {
-      if (scope === activeScope) { hoverPreview.close(); hoverPreview.cache.clear(); }
-      if (scope === activeScope) verifiedAt = 0;
-      this.sessions.get(scope)?.controller.abort();
-      this.sessions.delete(scope);
-      this.records.delete(scope);
-      this.collectedSessions.delete(scope);
-      if (scope === activeScope) {
-        inventory.reset(); this.indexed = null; catalogError = false; storageWriteFailed = false; storageWriteConnectionOnly = false;
-      }
+      dropCatalogScope(scope, { local: true });
       await storage.delete('catalogs', scope).catch(() => {});
       channel?.postMessage({ type: 'invalidate', scope });
     }
@@ -2629,6 +2896,22 @@ SOFTWARE.
             this.accessWrites.prime(record.key, record.accessedAt);
           }
         }
+        // Settle already-queued unstarted tasks for cached thumbnails immediately without dirtying accessedAt.
+        for (const [key, task] of [...thumbnailTasks]) {
+          if (task.scope !== scope || task.started) continue;
+          const record = this.memory.get(key);
+          if (!usableThumbnail(record)) continue;
+          task.controller.abort();
+          thumbnailTasks.delete(key);
+          for (const job of pendingRequests) {
+            if (job.scope === scope && job.file === task.file) job.cachedKey = key;
+          }
+          thumbnailCompleted.add(key);
+          inventory.mark(task.file, 'ready');
+          paintFile(task.file, record);
+        }
+        updateProgress();
+        composerMentions.paintIcons();
       }).catch(() => { if (activeScope === scope) this.loadFailed = scope; });
     }
 
@@ -2667,7 +2950,7 @@ SOFTWARE.
 
     async saveThumbnail(scope, file, response, signal) {
       signal?.throwIfAborted();
-      if (!response.ok || !/^image\//.test(response.headers.get('content-type') || '')) return;
+      if (!response.ok || !/^image\//i.test(response.headers.get('content-type') || '')) return;
       const blob = await response.blob();
       const bitmap = await createImageBitmap(blob);
       let dataUrl;
@@ -2689,16 +2972,22 @@ SOFTWARE.
       if (activeScope !== scope) return;
       const key = JSON.stringify([scope, file]);
       const record = { key, savedAt: Date.now(), accessedAt: Date.now(), dataUrl };
+      if (!validThumbnail(record)) return;
       try { await this.storage.put('thumbnails', record); }
       catch (error) { error.cacheStorageFailure = true; throw error; }
       signal?.throwIfAborted();
       if (activeScope !== scope) return;
       record.persisted = true;
       this.memory.set(key, record);
+      storedThumbnails.knownKeys.add(key);
+      storedThumbnails.misses.delete(key);
       this.accessWrites.prime(key, record.accessedAt);
       statistics.cachedThumbnails += 1;
       if (++this.writeCount % 32 === 0) safely(this.pruneThumbnails());
-      if (activeScope === scope) paintFile(file, record);
+      if (activeScope === scope) {
+        paintFile(file, record);
+        composerMentions.paintIcons();
+      }
     }
   }
 
@@ -2743,9 +3032,9 @@ SOFTWARE.
       });
     }
 
-    waitForMenuImage(file, signal, download, scope) {
+    waitForMenuImage(file, signal, download, scope, kind = 'image', perform = download) {
       return new Promise((resolve, reject) => {
-        const job = { file, signal, download, scope, resolve, reject, checking: false, settled: false };
+        const job = { file, signal, download, scope, kind, perform, resolve, reject, checking: false, settled: false };
         job.cancel = () => {
           if (job.settled) return;
           job.settled = true;
@@ -2761,9 +3050,16 @@ SOFTWARE.
     }
 
     settleNativeImages(scope, file, response, error) {
+      let releaseMetadata = false;
       for (const job of [...this.pending]) {
-        if (job.scope === scope && job.file === file) this.finishNativeImage(job, response?.clone(), error);
+        if (job.scope !== scope || job.file !== file) continue;
+        if (job.kind === 'metadata') {
+          if (error || !response?.ok) releaseMetadata = true;
+          continue;
+        }
+        this.finishNativeImage(job, response?.clone(), error);
       }
+      if (releaseMetadata) releaseNativeImages(scope, file, { metadataOnly: true });
     }
 
     finishNativeImage(job, response, error) {
@@ -2775,40 +3071,46 @@ SOFTWARE.
       else job.resolve(response);
     }
 
-    queueThumbnail(scope, file, download) {
-      if (!cacheAllowed()) return;
+    queueThumbnail(scope, file, download, { localOnly = false } = {}) {
+      if (!cacheAllowed() || !download) return;
       const key = JSON.stringify([scope, file]);
       if (this.tasks.has(key)) return;
       this.failed.delete(key);
       const controller = new AbortController();
-      const task = { controller, file, scope, download, started: false };
+      const task = { controller, file, scope, download, started: false, localOnly };
       this.tasks.set(key, task);
       inventory.mark(file, 'pending');
       updateProgress();
       safely(this.downloads.run(async () => {
         if (controller.signal.aborted || activeScope !== scope) return;
-        if (storageWriteFailed) {
-          const error = new Error('Cache storage unavailable');
-          error.cacheStorageFailure = true; error.cachePaused = true;
-          throw error;
-        }
         const cached = await cachedThumbnail(key);
         if (controller.signal.aborted || activeScope !== scope) return;
         if (cached) {
           statistics.thumbnailHits += 1;
           paintFile(file, cached);
+          composerMentions.paintIcons();
           for (const job of this.pending) {
             if (job.scope === scope && job.file === file) job.cachedKey = key;
           }
           // Keep native full-size requests pending on a hit; a 48px response would
           // contaminate the application's original-image query cache.
         } else {
+          if (storageWriteFailed) {
+            const error = new Error('Cache storage unavailable');
+            error.cacheStorageFailure = true; error.cachePaused = true;
+            throw error;
+          }
           task.started = true;
           const saved = await withRetries(controller.signal, async () => {
             const response = await boundedImage(signal => task.download(signal), CONFIG.requestTimeoutSeconds * 1000, controller.signal);
             if (controller.signal.aborted || activeScope !== scope) return false;
-            this.settleNativeImages(scope, file, response);
-            if (!response.ok) { const error = new Error('Preview download failed'); error.retryable = response.status >= 500; throw error; }
+            if (!response.ok) {
+              const error = new Error('Preview download failed');
+              error.retryable = response.status >= 500;
+              error.response = response;
+              throw error;
+            }
+            if (!task.localOnly) this.settleNativeImages(scope, file, response);
             await saveThumbnail(scope, file, response, controller.signal);
             if (!thumbnailMemory.get(key)?.persisted) throw new Error('Preview could not be cached');
             return true;
@@ -2829,7 +3131,7 @@ SOFTWARE.
           storageWriteFailed = true;
           // The network is fine: native requests still waiting for this file fetch it themselves.
           releaseNativeImages(scope, file);
-        } else this.settleNativeImages(scope, file, null, error);
+        } else this.settleNativeImages(scope, file, error.response || null, error.response ? undefined : error);
       }).finally(() => {
         if (this.tasks.get(key) === task) this.tasks.delete(key);
         updateProgress();
@@ -2856,7 +3158,7 @@ SOFTWARE.
       const visibleIds = new Set();
       for (const state of mountedMenus.values()) {
         if (!state.menu.isConnected) continue;
-        for (const row of visibleRows(state)) {
+        for (const row of menuController.visibleRows(state)) {
           const ref = state.references.get(row);
           if (ref) visibleIds.add(ref.id);
           for (const pointer of [ref?.asset_pointer, ref?.thumbnail_asset_pointer]) {
@@ -2879,7 +3181,13 @@ SOFTWARE.
           statistics.thumbnailHits += 1;
           thumbnailCache.touch(cached);
           paintFile(job.file, cached);
-        } else this.queueThumbnail(job.scope, job.file, job.download);
+        } else {
+          const source = job.download ? null : referenceSources.get(job.file);
+          const download = job.download || (source && source.transport.scope === job.scope
+            ? signal => this.downloadReference(source.reference, source.transport, signal)
+            : null);
+          if (download) this.queueThumbnail(job.scope, job.file, download);
+        }
       }
       this.downloads.drain(); // Re-evaluate queued priorities after a scroll or search.
       updateProgress();
@@ -2894,29 +3202,48 @@ SOFTWARE.
       this.selection = null;
       this.bypassUntil = 0;
     }
-    releaseNativeImages(scope, file) {
+    releaseNativeImages(scope, file, { metadataOnly = false } = {}) {
       const jobs = [...pendingRequests].filter(job => job.scope === scope && job.file === file);
       if (!jobs.length) return;
-      const key = JSON.stringify([scope, file]);
-      if (this.selectedRequests.has(key)) return;
-      const request = boundedImage(jobs[0].download, CONFIG.selectedImageTimeoutSeconds * 1000);
-      this.selectedRequests.set(key, request);
-      safely(request.then(response => settleNativeImages(scope, file, response))
-        .catch(error => settleNativeImages(scope, file, null, error)).finally(() => {
-        if (this.selectedRequests.get(key) === request) this.selectedRequests.delete(key);
-      }));
+      const finishGroup = (group, selectedKey, executor) => {
+        if (!group.length || this.selectedRequests.has(selectedKey)) return;
+        const request = boundedImage(executor, CONFIG.selectedImageTimeoutSeconds * 1000);
+        this.selectedRequests.set(selectedKey, request);
+        safely(request.then(response => {
+          for (const job of group) thumbnailLoader.finishNativeImage(job, response?.clone());
+        }).catch(error => {
+          for (const job of group) thumbnailLoader.finishNativeImage(job, null, error);
+        }).finally(() => {
+          if (this.selectedRequests.get(selectedKey) === request) this.selectedRequests.delete(selectedKey);
+        }));
+      };
+      if (!metadataOnly) {
+        const imageJobs = jobs.filter(job => job.kind !== 'metadata');
+        finishGroup(imageJobs, JSON.stringify([scope, file]), imageJobs[0]?.download);
+      }
+      const metadataJobs = jobs.filter(job => job.kind === 'metadata');
+      finishGroup(metadataJobs, JSON.stringify([scope, file, 'metadata']), metadataJobs[0]?.perform || metadataJobs[0]?.download);
+    }
+
+    pruneSelection() {
+      if (this.selection && !this.selection.invoked && !this.selection.menu.isConnected) {
+        const stale = this.selection;
+        this.selection = null;
+        stale.controller.abort();
+      }
     }
 
     beforeReferenceSelection(event) {
+      this.pruneSelection();
       if (event.type === 'keydown' && !['Enter', ' ', 'Spacebar'].includes(event.key)) return;
-      hoverPreview.close();
       const row = event.target instanceof Element ? event.target.closest('[role="menuitem"]') : null;
       if (!row || row.getAttribute('aria-disabled') === 'true' || row.hasAttribute('disabled')) return;
+      hoverPreview.close();
       if (!this.passThrough.has(row) && event.type !== 'pointerdown' && (event.type !== 'click' || event.button === undefined || event.button === 0)) {
         const state = [...mountedMenus.values()].find(state => state.menu.isConnected && state.menu.contains(row));
         if (state && this.selection) { event.preventDefault(); event.stopImmediatePropagation(); return; }
         const bridge = state && activeScope && activeTransport?.scope === activeScope ? nativeSelection(row, activeAccount) : null;
-        if (bridge && verifiedOwner([bridge.reference]) === JSON.parse(activeScope)[0]) {
+        if (bridge && verifiedOwner([bridge.reference]) === scopeOwner(activeScope)) {
           event.preventDefault();
           event.stopImmediatePropagation();
           safely(this.selectOneReference(state, row, bridge, activeTransport));
@@ -2924,14 +3251,17 @@ SOFTWARE.
         }
       }
       for (const state of mountedMenus.values()) {
-        const ref = state.references.get(row);
-        if (!ref || !state.menu.isConnected || !activeScope) continue;
+        const ref = state.references.get(row) || state.readOnlyRefs?.get(row) ||
+          (state.menu.contains(row) ? menuController.rowReference(row, state) : null);
+        if (!ref || !state.menu.isConnected) continue;
         // Run in capture phase, before React starts regeneration. New application
         // requests must never join the preview-only queue during this operation.
         this.bypassUntil = Date.now() + CONFIG.selectedImageTimeoutSeconds * 1000;
         for (const pointer of [ref.asset_pointer, ref.thumbnail_asset_pointer]) {
           const file = fileKey(pointer);
-          if (file) this.releaseNativeImages(activeScope, file);
+          if (!file) continue;
+          if (activeScope) this.releaseNativeImages(activeScope, file);
+          releaseReadOnlyPending(file);
         }
         break;
       }
@@ -2955,7 +3285,7 @@ SOFTWARE.
     }
 
     async selectOneReference(state, row, initial, transport) {
-      const operation = { controller: new AbortController() };
+      const operation = { controller: new AbortController(), menu: state.menu, invoked: false };
       this.selection = operation;
       const href = location.href;
       let invoked = false;
@@ -2997,6 +3327,7 @@ SOFTWARE.
         state.notice = localizedNotice('send', 'sendingRegeneration', true);
         showStatus(state);
         invoked = true;
+        operation.invoked = true;
         const sent = await bridge.onRecreate(bridge.reference);
         if (sent) {
           statistics.fastSelections += 1;
@@ -3018,22 +3349,110 @@ SOFTWARE.
     }
   }
 
+  class StoredPreviewOpener {
+    constructor(misses = new RecentMisses()) {
+      this.misses = misses;
+      this.lookup = null;
+    }
+    cancel() { this.lookup = null; }
+    matches(key, row) { return this.lookup?.key === key && this.lookup.row === row; }
+    open({ key, row, state = null, cursor = null, closeBefore = null, canOpen, show }) {
+      if (this.matches(key, row)) {
+        if (cursor) this.lookup.cursor = cursor;
+        return;
+      }
+      closeBefore?.();
+      if (this.misses.has(key)) { this.lookup = null; return; }
+      const lookup = { key, row, state, cursor };
+      this.lookup = lookup;
+      safely(storedPreviewUrl(key).then(url => {
+        if (this.lookup !== lookup) return;
+        this.lookup = null;
+        if (!url) { this.misses.add(key); return; }
+        if (!canOpen(lookup)) return;
+        show(url, lookup);
+      }));
+    }
+  }
+
   // DOM ownership, filtering, drawing and hover previews.
   class ReferenceMenuController {
     constructor(index) {
       this.mounted = new Map();
-      this.rows = new MenuRows(index, row => this.rowLabels(row));
+      this.rows = new MenuRows(index, row => this.rowLabels(row), row => rowFiberInfo(row).referenceId);
       this.previewPanel = null;
+      this.previewNotice = null;
       this.previewMoveScheduled = false;
       this.observer = null;
       this.scheduled = false;
       this.progressTimer = null;
+      this.readOnlyPreviewMisses = new RecentMisses();
+      this.readOnlyOpener = new StoredPreviewOpener(this.readOnlyPreviewMisses);
+      this.nativeSnapshots = new WeakMap();
     }
+    get readOnlyHover() { return this.readOnlyOpener.lookup; }
+    set readOnlyHover(value) { this.readOnlyOpener.lookup = value; }
     visible(row, menu) {
       if (!row.isConnected || row.hidden) return false;
       const a = row.getBoundingClientRect();
       const b = menu.getBoundingClientRect();
       return a.height > 0 && a.bottom > Math.max(0, b.top) && a.top < Math.min(innerHeight, b.bottom);
+    }
+
+    isActiveScope() {
+      return Boolean(activeScope && activeTransport?.scope === activeScope);
+    }
+
+    readOnlySnapshot(state = null) {
+      const account = requestContext?.account ?? null;
+      if (readOnlyCatalog && readOnlyCatalog.identity === userId &&
+          (!requestContext || readOnlyCatalog.account === account)) {
+        return readOnlyCatalog;
+      }
+      const node = state?.menu?.querySelector?.('[role="menuitem"]') || state?.menu;
+      const bridge = node ? nativeCatalog(node, account) : null;
+      if (!bridge) return null;
+      const items = Array.isArray(bridge.query.state.data) ? bridge.query.state.data :
+        Array.isArray(bridge.query.options.placeholderData) ? bridge.query.options.placeholderData : null;
+      if (!items) return null;
+      // Rows, hover and the status line ask for this on every paint; rebuild only when the app's list or auth state changes.
+      const authKey = JSON.stringify([userId, activeScope, Boolean(requestContext), account]);
+      const cached = this.nativeSnapshots.get(items);
+      if (cached && cached.length === items.length && cached.authKey === authKey) return cached.snapshot;
+      const clean = items.map(cleanReference).filter(Boolean);
+      const owner = verifiedOwner(clean);
+      const snapshot = createCatalogSnapshot({
+        scope: scopeForOwner(owner),
+        account,
+        record: { pages: [{ items: clean }] },
+        items: clean,
+      });
+      this.nativeSnapshots.set(items, { length: items.length, authKey, snapshot });
+      return snapshot;
+    }
+
+    readOnlyScopeFor(reference, state = null) {
+      const owner = verifiedOwner([reference]) || referenceOwner(reference?.id);
+      if (!owner) return null;
+      const scoped = scopeForOwner(owner);
+      if (scoped) return scoped;
+      const snapshot = this.readOnlySnapshot(state);
+      if (scopeOwner(snapshot?.scope) === owner) return snapshot.scope;
+      const account = requestContext ? (requestContext.account || 'server-verified') : null;
+      for (const [scope, record] of catalogs) {
+        try {
+          const [recordOwner, recordAccount] = JSON.parse(scope);
+          if (recordOwner === owner && (!userId || record.identity === userId) &&
+              (!account || recordAccount === account)) return scope;
+        } catch {}
+      }
+      return null;
+    }
+
+    readOnlyAccountFor(scope, state = null) {
+      if (requestContext) return requestContext.account ?? null;
+      const snapshot = this.readOnlySnapshot(state);
+      return snapshot?.scope === scope ? (snapshot.account ?? null) : null;
     }
 
     rowLabels(row) {
@@ -3048,12 +3467,24 @@ SOFTWARE.
       return labels;
     }
 
-    rowReference(row) {
-      for (const label of this.rowLabels(row)) {
-        const refs = referencesByName.get(label);
-        if (refs?.length === 1) return refs[0];
+    rowReference(row, state = null) {
+      const caching = this.isActiveScope();
+      const id = rowFiberInfo(row).referenceId;
+      if (caching) {
+        if (id && referencesById.has(id)) return referencesById.get(id);
+        for (const label of this.rowLabels(row)) {
+          const refs = referencesByName.get(label);
+          if (refs?.length === 1) return refs[0];
+        }
+      } else {
+        const snapshot = this.readOnlySnapshot(state);
+        if (id && snapshot?.byId.has(id)) return snapshot.byId.get(id);
+        for (const label of this.rowLabels(row)) {
+          const refs = snapshot?.byName.get(label);
+          if (refs?.length === 1) return refs[0];
+        }
       }
-      return null;
+      return nativeSelection(row, caching ? activeAccount : (requestContext?.account ?? null))?.reference || null;
     }
 
     findRow(file) {
@@ -3064,11 +3495,38 @@ SOFTWARE.
       return null;
     }
 
+    syncReadOnlyRows(state) {
+      state.readOnlyRefs?.clear();
+      state.readOnlyByFile?.clear();
+      if (this.isActiveScope() || !state.rows) return;
+      for (const row of state.rows) {
+        const ref = this.rowReference(row, state);
+        if (!ref) continue;
+        state.readOnlyRefs?.set(row, ref);
+        for (const pointer of [ref.asset_pointer, ref.thumbnail_asset_pointer]) {
+          const file = fileKey(pointer);
+          if (!file) continue;
+          const bucket = state.readOnlyByFile?.get(file) || new Set();
+          bucket.add(row);
+          state.readOnlyByFile?.set(file, bucket);
+        }
+      }
+    }
+
+    findReadOnlyRow(file) {
+      for (const state of this.mounted.values()) {
+        if (!state.menu.isConnected) continue;
+        const row = [...(state.readOnlyByFile?.get(file) || [])].find(r => r.isConnected);
+        if (row) return { row, state, reference: state.readOnlyRefs?.get(row) || null };
+      }
+      return null;
+    }
+
     visibleRows(state) {
       return this.rows.visible(state, innerHeight);
     }
 
-    paint(row, record) {
+    paint(row, record, { readOnly = false } = {}) {
       const slot = row.querySelector('[data-leading-icon-slot="menu"]');
       if (!slot) return;
       slot.dataset.refFastIcon = '';
@@ -3085,14 +3543,25 @@ SOFTWARE.
       image.onerror = () => {
         image.remove();
         delete slot.dataset.refFastIcon;
+        if (readOnly) {
+          try {
+            const [, file] = JSON.parse(record.key);
+            storedThumbnails.records.delete(record.key);
+            storedThumbnails.knownKeys.delete(record.key);
+            releaseReadOnlyPending(file);
+          } catch {}
+          return;
+        }
+        if (!this.isActiveScope()) return;
+        const [owner, file] = JSON.parse(record.key);
+        if (owner !== activeScope) return;
         thumbnailMemory.delete(record.key);
         thumbnailCompleted.delete(record.key);
-        inventory.mark(JSON.parse(record.key)[1], 'pending');
+        inventory.mark(file, 'pending');
         safely(storage.delete('thumbnails', record.key));
         for (const job of pendingRequests) {
           if (job.cachedKey === record.key) { job.checking = false; job.cachedKey = null; }
         }
-        const file = JSON.parse(record.key)[1];
         const source = referenceSources.get(file);
         if (source && source.transport.scope === activeScope) queueThumbnail(activeScope, file,
           signal => downloadReference(source.reference, source.transport, signal));
@@ -3113,6 +3582,7 @@ SOFTWARE.
         this.progressTimer = null;
         for (const state of this.mounted.values()) this.showStatus(state);
       }, 100);
+      this.progressTimer?.unref?.();
     }
 
     showStatus(state) {
@@ -3129,6 +3599,20 @@ SOFTWARE.
         state.refresh.setAttribute('aria-busy', String(button.busy));
       }
       if (state.notice) { renderUiStatus(state.status, state.notice); return; }
+      if (!this.isActiveScope()) {
+        const snapshot = this.readOnlySnapshot(state);
+        const total = snapshot ? snapshot.byId.size : state.rows.length;
+        const known = Boolean(snapshot) || state.rows.length > 0;
+        const pages = snapshot?.record?.pages?.length || 0;
+        const status = referenceStatus({
+          readOnly: true,
+          progress: { total: known ? total : null, discovered: total, ready: 0, failed: 0, pending: 0, complete: false },
+          matched: state.matched, query: state.input?.value, pages,
+          checkingCache: storage.checkingReads, storageError: storage.lastError,
+        });
+        renderUiStatus(state.status, status);
+        return;
+      }
       const progress = inventory.summary();
       const pages = collectedSessions.get(activeScope)?.pages.size || 0;
       const refresh = backgroundCatalogs.get(activeScope);
@@ -3163,8 +3647,14 @@ SOFTWARE.
       const native = context.nativeImage === false ? null : context.row.querySelector('img:not([data-ref-fast-thumbnail])');
       const source = native?.getAttribute('src');
       const local = native?.complete && native.naturalWidth > CONFIG.thumbnailSize && /^(blob:|data:image\/)/.test(source || '');
-      const response = local ? await boundedImage(s => originalFetch(source, { signal: s }),
-        CONFIG.requestTimeoutSeconds * 1000, signal) : await downloadReference(reference, context.transport, signal);
+      const localResponse = local ? await boundedImage(s => originalFetch(source, { signal: s }),
+        CONFIG.requestTimeoutSeconds * 1000, signal).catch(error => {
+          if (signal?.aborted) throw error;
+          return null;
+        }) : null;
+      const response = localResponse?.ok && /^image\//i.test(localResponse.headers.get('content-type') || '')
+        ? localResponse
+        : await downloadReference(reference, context.transport, signal);
       if (!response.ok || !/^image\//i.test(response.headers.get('content-type') || '')) throw new Error('Preview unavailable');
       return response.blob();
     }
@@ -3257,17 +3747,42 @@ SOFTWARE.
 
     previewRow(state, target, cursor = null) {
       const row = target instanceof Element ? target.closest('[role="menuitem"]') : null;
-      if (!row || !state.menu.contains(row) || !activeScope || activeTransport?.scope !== activeScope) {
-        hoverPreview.close(); return;
+      if (!row || !state.menu.contains(row) || !this.rows.isManaged(state, row)) {
+        this.readOnlyHover = null; hoverPreview.close(); return;
       }
-      const reference = state.references.get(row) || this.rowReference(row) || nativeSelection(row, activeAccount)?.reference;
-      if (!reference || verifiedOwner([reference]) !== JSON.parse(activeScope)[0]) { hoverPreview.close(); return; }
-      const key = previewKey(activeScope, reference);
+      const caching = this.isActiveScope();
+      const reference = state.references.get(row) || state.readOnlyRefs?.get(row) || this.rowReference(row, state);
+      if (!reference) { this.readOnlyHover = null; hoverPreview.close(); return; }
+      if (caching) {
+        this.readOnlyHover = null;
+        if (verifiedOwner([reference]) !== scopeOwner(activeScope)) { hoverPreview.close(); return; }
+        const key = previewKey(activeScope, reference);
+        if (hoverPreview.target?.key === key && hoverPreview.target.context.row === row) {
+          if (cursor) hoverPreview.target.context.cursor = cursor;
+          return;
+        }
+        hoverPreview.open(key, reference, { row, state, container: state.menu, scope: activeScope, transport: activeTransport, cursor });
+        return;
+      }
+      const scope = this.readOnlyScopeFor(reference, state);
+      if (!scope || verifiedOwner([reference]) !== scopeOwner(scope)) {
+        this.readOnlyHover = null; hoverPreview.close(); return;
+      }
+      const key = previewKey(scope, reference);
+      const account = this.readOnlyAccountFor(scope, state);
       if (hoverPreview.target?.key === key && hoverPreview.target.context.row === row) {
         if (cursor) hoverPreview.target.context.cursor = cursor;
         return;
       }
-      hoverPreview.open(key, reference, { row, state, container: state.menu, scope: activeScope, transport: activeTransport, cursor });
+      this.readOnlyOpener.open({
+        key, row, state, cursor,
+        closeBefore: () => hoverPreview.close(),
+        canOpen: () => !this.isActiveScope() && row.isConnected && this.visible(row, state.menu),
+        show: (url, lookup) => hoverPreview.open(key, reference, {
+          row, state, container: state.menu, scope, account, identity: userId,
+          stored: url, cursor: lookup.cursor,
+        }),
+      });
     }
 
     addSearch(menu) {
@@ -3304,8 +3819,12 @@ SOFTWARE.
         if (event.pointerType !== 'touch') this.previewRow(state, event.target, { x: event.clientX, y: event.clientY });
       });
       menu.addEventListener('pointermove', event => {
+        if (event.pointerType === 'touch') return;
+        if (this.readOnlyHover?.state === state && this.readOnlyHover.row.contains(event.target)) {
+          this.readOnlyHover.cursor = { x: event.clientX, y: event.clientY };
+        }
         const context = hoverPreview.target?.context;
-        if (event.pointerType === 'touch' || context?.state !== state || !context.row.contains(event.target)) return;
+        if (context?.state !== state || !context.row.contains(event.target)) return;
         context.cursor = { x: event.clientX, y: event.clientY };
         if (this.previewMoveScheduled) return;
         this.previewMoveScheduled = true;
@@ -3314,17 +3833,18 @@ SOFTWARE.
           if (hoverPreview.target) this.positionHoverPreview(hoverPreview.target.context);
         });
       });
+      const closePreview = () => { this.readOnlyHover = null; hoverPreview.close(); };
       menu.addEventListener('pointerout', event => {
-        const row = hoverPreview.target?.context.row;
-        if (row && row.contains(event.target) && !row.contains(event.relatedTarget)) hoverPreview.close();
+        const row = hoverPreview.target?.context.row || this.readOnlyHover?.row;
+        if (row && row.contains(event.target) && !row.contains(event.relatedTarget)) closePreview();
       });
       menu.addEventListener('focusin', event => this.previewRow(state, event.target));
       menu.addEventListener('focusout', event => {
-        const row = hoverPreview.target?.context.row;
-        if (row && row.contains(event.target) && !row.contains(event.relatedTarget)) hoverPreview.close();
+        const row = hoverPreview.target?.context.row || this.readOnlyHover?.row;
+        if (row && row.contains(event.target) && !row.contains(event.relatedTarget)) closePreview();
       });
-      menu.addEventListener('keydown', event => { if (event.key === 'Escape') hoverPreview.close(); });
-      menu.addEventListener('scroll', () => { hoverPreview.close(); this.scheduleMenuPaint(state); }, { passive: true, capture: true });
+      menu.addEventListener('keydown', event => { if (event.key === 'Escape') closePreview(); });
+      menu.addEventListener('scroll', () => { closePreview(); this.scheduleMenuPaint(state); }, { passive: true, capture: true });
       return state;
     }
 
@@ -3347,20 +3867,33 @@ SOFTWARE.
     }
 
     paintVisible(state) {
+      const caching = this.isActiveScope();
       for (const row of this.visibleRows(state)) {
-        const ref = state.references.get(row) || (activeTransport?.scope === activeScope ? nativeSelection(row, activeAccount)?.reference : null);
-        if (!ref || !activeScope) continue;
+        const ref = caching
+          ? (state.references.get(row) || this.rowReference(row, state))
+          : (state.readOnlyRefs?.get(row) || this.rowReference(row, state));
+        if (!ref) continue;
         const file = referenceFile(ref);
         if (!file) continue;
-        const scope = activeScope;
+        if (!caching) {
+          const scope = this.readOnlyScopeFor(ref, state);
+          if (!scope) continue;
+          safely(storedThumbnails.indexScope(scope));
+          const key = JSON.stringify([scope, file]);
+          safely(storedThumbnails.load(key).then(record => {
+            if (record && !this.isActiveScope() && row.isConnected) this.paint(row, record, { readOnly: true });
+          }));
+          continue;
+        }
         state.references.set(row, ref);
+        const scope = activeScope;
         for (const pointer of [ref.asset_pointer, ref.thumbnail_asset_pointer]) {
           const key = fileKey(pointer);
           if (key) {
             const bucket = state.rowsByFile.get(key) || new Set(); bucket.add(row); state.rowsByFile.set(key, bucket);
           }
         }
-        if (activeTransport?.scope === scope && verifiedOwner([ref]) === JSON.parse(scope)[0]) {
+        if (verifiedOwner([ref]) === scopeOwner(scope)) {
           const transport = activeTransport;
           referenceSources.set(file, { reference: ref, transport });
           if (!thumbnailMemory.has(JSON.stringify([scope, file]))) queueThumbnail(scope, file,
@@ -3384,10 +3917,28 @@ SOFTWARE.
       const source = image?.getAttribute('src');
       if (image?.complete && image.naturalWidth && /^(blob:|data:)/.test(source || '')) {
         // Include offscreen images already in ChatGPT's memory cache as well.
-        const local = signal => originalFetch(source, { signal });
+        const localOnly = !(image.naturalWidth > CONFIG.thumbnailSize);
+        const scope = activeScope;
+        const local = async signal => {
+          try {
+            const response = await originalFetch(source, { signal });
+            if (response.ok) return response;
+          } catch (error) {
+            if (signal?.aborted) throw error;
+          }
+          const entry = referenceSources.get(file);
+          if (entry && entry.transport.scope === scope) {
+            const currentTask = thumbnailTasks.get(key);
+            if (currentTask) currentTask.localOnly = false;
+            return downloadReference(entry.reference, entry.transport, signal);
+          }
+          throw new Error('Local thumbnail unavailable');
+        };
         const task = thumbnailTasks.get(key);
-        if (task && !task.started) task.download = local;
-        else if (!task) queueThumbnail(activeScope, file, local);
+        if (task && !task.started) {
+          task.download = local;
+          task.localOnly = localOnly;
+        } else if (!task) queueThumbnail(activeScope, file, local, { localOnly });
       }
     }
 
@@ -3400,23 +3951,44 @@ SOFTWARE.
       for (const [menu] of this.mounted) {
         if (!menu.isConnected) this.mounted.delete(menu);
       }
+      if (lastButton && !lastButton.isConnected) lastButton = null;
+      nativeBridge.pruneSelection();
       for (const menu of document.querySelectorAll('[role="menu"]')) {
         let state = this.mounted.get(menu);
         const items = [...menu.querySelectorAll('[role="menuitem"]')];
         const controlled = lastButton && lastButton.getAttribute('aria-controls') === menu.id;
-        if (!state && !controlled && !items.some(row => this.rowReference(row))) continue;
-        if (!state) state = this.addSearch(menu);
-        if (this.rows.sync(state, items)) this.filterRows(state);
+        // Only rows rendered for a reference (React key AccountUserId_…~refimage_…) identify the menu;
+        // an ancestor reference provider alone also covers unrelated menus in the same image block.
+        const fiberMatched = !state && !controlled && items.some(row => Boolean(rowFiberInfo(row).referenceId));
+        const nameMatched = !state && !controlled && !fiberMatched &&
+          !items.some(row => Boolean(reactFiber(row))) && items.some(row => this.rowReference(row));
+        if (!state && !controlled && !fiberMatched && !nameMatched) continue;
+        if (!state) {
+          state = this.addSearch(menu);
+          // A menu matched only by row names may not be the reference menu, so it never starts caching.
+          if (fiberMatched) catalogController.refreshOnOpen();
+        }
+        state.lastItemCount = items.length;
+        const libraryItems = items.filter(isLibraryMenuItem);
+        const synced = this.rows.sync(state, libraryItems);
+        this.syncReadOnlyRows(state);
+        if (synced) this.filterRows(state);
+        else this.showStatus(state);
       }
       if (activeScope && catalogController.indexed && backgroundCatalogs.get(activeScope)?.servingSnapshot &&
           backgroundCatalogs.get(activeScope).complete) {
         catalogController.publish(catalogController.indexed, activeScope);
       }
       for (const job of [...pendingRequests]) {
-        const key = JSON.stringify([job.scope, job.file]);
+        const selectedKey = job.kind === 'metadata'
+          ? JSON.stringify([job.scope, job.file, 'metadata'])
+          : JSON.stringify([job.scope, job.file]);
         // An unmounted preview must not leave a shared query pending forever,
         // including application requests which did not supply an AbortSignal.
-        if (!this.findRow(job.file) && !selectedImageRequests.has(key)) job.cancel();
+        if (!this.findRow(job.file) && !selectedImageRequests.has(selectedKey)) job.cancel();
+      }
+      for (const job of [...readOnlyPending]) {
+        if (!this.findReadOnlyRow(job.file)) job.cancel();
       }
       scheduleImagePump();
     }
@@ -3444,8 +4016,7 @@ SOFTWARE.
         .ref-fast-controls button { display:flex; align-items:center; justify-content:center;
           padding:8px; color:inherit; background:transparent; border:1px solid #8886; border-radius:8px; }
         .ref-fast-controls button:disabled { opacity:.6; cursor:wait; }
-        .ref-fast-controls button[aria-busy="true"] .ref-fast-centered > .ref-fast-rotor { animation:ref-fast-spin 1s linear infinite; }
-        .ref-fast-controls button[aria-busy="true"] .ref-fast-refresh:not(.ref-fast-centered) { animation:ref-fast-pulse 1.2s ease-in-out infinite; }
+        .ref-fast-controls button[aria-busy="true"] .ref-fast-rotor { animation:ref-fast-spin 1s linear infinite; }
         @keyframes ref-fast-spin { to { transform:rotate(360deg); } }
         .ref-fast-controls small { grid-column:1/-1; opacity:.8; display:flex; align-items:center; flex-wrap:wrap; gap:6px 12px; }
         .ref-fast-metric { display:inline-flex; align-items:center; gap:4px; white-space:nowrap; font-variant-numeric:tabular-nums; }
@@ -3467,8 +4038,7 @@ SOFTWARE.
         .ref-fast-working { animation:ref-fast-pulse 1.2s ease-in-out infinite; }
         @keyframes ref-fast-pulse { 50% { opacity:.25; } }
         @media(prefers-reduced-motion:reduce) {
-          .ref-fast-working, .ref-fast-controls button[aria-busy="true"] .ref-fast-centered > .ref-fast-rotor,
-          .ref-fast-controls button[aria-busy="true"] .ref-fast-refresh:not(.ref-fast-centered) { animation:none; }
+          .ref-fast-working, .ref-fast-controls button[aria-busy="true"] .ref-fast-rotor { animation:none; }
         }
         .ref-fast-row { position:relative; content-visibility:auto; contain-intrinsic-size:auto 36px; }
         .ref-fast-row[hidden] { display:none !important; }
@@ -3541,6 +4111,91 @@ SOFTWARE.
     }
   }
 
+  function scopeForOwner(owner) {
+    if (!owner) return null;
+    if (scopeOwner(activeScope) === owner) return activeScope;
+    return requestContext ? scopeKey(owner, requestContext.account || 'server-verified') : null;
+  }
+
+  class StoredThumbnails {
+    constructor(maxEntries = 600) {
+      this.maxEntries = maxEntries;
+      this.records = new Map();
+      this.lookups = new Map();
+      this.indexedScopes = new Map();
+      this.knownKeys = new Set();
+      this.misses = new RecentMisses();
+    }
+    peek(key) {
+      const memory = thumbnailMemory.get(key);
+      if (usableThumbnail(memory)) return memory;
+      const known = this.records.get(key);
+      if (usableThumbnail(known)) return known;
+      if (known) this.records.delete(key);
+      return null;
+    }
+    indexScope(scope) {
+      if (!scope) return Promise.resolve(new Set());
+      const existing = this.indexedScopes.get(scope);
+      if (existing) return existing;
+      const pending = storage.request('thumbnails', 'readonly', table => table.getAll()).then(records => {
+        const keys = new Set();
+        for (const record of records || []) {
+          if (scopeOwner(record?.key) === scope && usableThumbnail(record)) {
+            this.knownKeys.add(record.key);
+            keys.add(record.key);
+          }
+        }
+        return keys;
+      }).catch(error => {
+        if (this.indexedScopes.get(scope) === pending) this.indexedScopes.delete(scope);
+        throw error;
+      });
+      this.indexedScopes.set(scope, pending);
+      return pending;
+    }
+    async hasScopeKey(key) {
+      if (this.peek(key) || this.knownKeys.has(key)) return true;
+      if (this.misses.has(key)) return false;
+      const scope = scopeOwner(key);
+      if (!scope) return false;
+      await this.indexScope(scope).catch(() => null);
+      return this.knownKeys.has(key) || Boolean(this.peek(key));
+    }
+    load(key) {
+      const cached = this.peek(key);
+      if (cached) { this.knownKeys.add(key); return Promise.resolve(cached); }
+      if (this.misses.has(key)) return Promise.resolve(null);
+      const pending = this.lookups.get(key);
+      if (pending) return pending;
+      const lookup = storage.get('thumbnails', key).catch(() => null).then(record => {
+        this.lookups.delete(key);
+        if (record?.key !== key || !usableThumbnail(record)) { this.misses.add(key); return null; }
+        this.knownKeys.add(key);
+        this.records.set(key, record);
+        while (this.records.size > this.maxEntries) this.records.delete(this.records.keys().next().value);
+        return record;
+      });
+      this.lookups.set(key, lookup);
+      return lookup;
+    }
+    deleteScope(scope) {
+      this.indexedScopes.delete(scope);
+      for (const key of this.records.keys()) {
+        if (scopeOwner(key) === scope) this.records.delete(key);
+      }
+      for (const key of this.knownKeys) {
+        if (scopeOwner(key) === scope) this.knownKeys.delete(key);
+      }
+    }
+    clear() {
+      this.records.clear();
+      this.indexedScopes.clear();
+      this.knownKeys.clear();
+      this.misses.clear();
+    }
+  }
+
   // Composer @-mentions: large previews for the highlighted suggestion, caching started by opening the reference
   // suggestions, and stored-thumbnail covers for reference icons (suggestion rows and inserted mention pills).
   class ComposerMentions {
@@ -3548,18 +4203,16 @@ SOFTWARE.
       this.open = false;
       this.covers = new WeakMap();      // host element → { img, key }
       this.skipped = new WeakSet();     // hosts that are not references
-      this.thumbs = new Map();          // thumbnail key → data URL read from disk (bounded)
-      this.thumbLookups = new Map();
-      this.thumbMisses = new RecentMisses();
-      this.storedLookup = null;         // in-flight disk preview lookup { key, row }
       this.storedMisses = new RecentMisses();
+      this.storedOpener = new StoredPreviewOpener(this.storedMisses);
     }
+    get storedLookup() { return this.storedOpener.lookup; }
+    set storedLookup(value) { this.storedOpener.lookup = value; }
 
     // The thumbnail/preview scope of a reference owner: the active scope when it belongs to that owner, otherwise
     // the scope this account would store it under.
     ownerScope(owner) {
-      if (activeScope && JSON.parse(activeScope)[0] === owner) return activeScope;
-      return requestContext ? scopeKey(owner, requestContext.account || 'server-verified') : null;
+      return scopeForOwner(owner);
     }
 
     // ChatGPT's 50-entry icon cache keeps swapping icons inside covered rows and pills; only a host's own
@@ -3596,7 +4249,7 @@ SOFTWARE.
       const id = mentionReferenceId(found.row);
       const managed = Boolean(activeScope && activeTransport?.scope === activeScope);
       const reference = managed && id ? referencesById.get(id) : null;
-      if (!reference || verifiedOwner([reference]) !== JSON.parse(activeScope)[0]) { this.previewStored(found, id); return; }
+      if (!reference || verifiedOwner([reference]) !== scopeOwner(activeScope)) { this.previewStored(found, id); return; }
       this.storedLookup = null;
       const key = previewKey(activeScope, reference);
       if (target?.key === key && target.context.row === found.row) return;
@@ -3610,7 +4263,7 @@ SOFTWARE.
     // already stored on disk for this account. No network request and no disk write is made here.
     previewStored(found, id) {
       const target = hoverPreview.target;
-      const closeMention = () => { if (target?.context.mention) hoverPreview.close(); };
+      const closeMention = () => { if (hoverPreview.target?.context.mention) hoverPreview.close(); };
       const owner = referenceOwner(id), pointers = owner ? mentionImagePointers(found.row) : null;
       if (!pointers || !userId || !requestContext) { this.storedLookup = null; closeMention(); return; }
       const account = requestContext.account ?? null;
@@ -3619,19 +4272,15 @@ SOFTWARE.
       const key = previewKey(scope, reference);
       if (target?.key === key && target.context.row === found.row) return;
       if (target && !target.context.mention && hoverPreview.current(target.context)) return;
-      if (this.storedLookup?.key === key && this.storedLookup.row === found.row) return;
-      closeMention();
-      if (this.storedMisses.has(key)) { this.storedLookup = null; return; }
-      const lookup = { key, row: found.row };
-      this.storedLookup = lookup;
-      safely(storedPreviewUrl(key).then(url => {
-        if (this.storedLookup !== lookup) return;
-        this.storedLookup = null;
-        if (!url) { this.storedMisses.add(key); return; }
-        if (!found.row.isConnected || !mentionHighlighted(found.row) || (requestContext?.account ?? null) !== account) return;
-        hoverPreview.open(key, reference, { row: found.row, container: mentionContainer(found), scope, account, stored: url,
-          cursor: null, mention: true, nativeImage: false });
-      }));
+      this.storedOpener.open({
+        key, row: found.row,
+        closeBefore: closeMention,
+        canOpen: () => found.row.isConnected && mentionHighlighted(found.row) && (requestContext?.account ?? null) === account,
+        show: url => hoverPreview.open(key, reference, {
+          row: found.row, container: mentionContainer(found), scope, account, stored: url,
+          cursor: null, mention: true, nativeImage: false,
+        }),
+      });
     }
 
     // The reference id and image pointers of a suggestion row or an inserted mention pill.
@@ -3653,7 +4302,10 @@ SOFTWARE.
         if (!box) continue; // An off-screen placeholder row has no icon yet.
         const reference = this.reference(host);
         const file = reference ? referenceFile(reference.pointers) : null;
-        if (!file) { this.skipped.add(host); continue; }
+        if (!file) {
+          if (host.matches(REFERENCE_PILL) || !mentionReferenceId(host)) this.skipped.add(host);
+          continue;
+        }
         const scope = this.ownerScope(reference.owner);
         if (!scope) continue;
         const key = JSON.stringify([scope, file]);
@@ -3663,25 +4315,18 @@ SOFTWARE.
     }
 
     thumbnail(key) {
-      const memory = thumbnailMemory.get(key);
-      if (usableThumbnail(memory)) return memory.dataUrl;
-      const known = this.thumbs.get(key);
-      if (known) return known;
-      if (this.thumbLookups.has(key) || this.thumbMisses.has(key)) return null;
-      const lookup = storage.get('thumbnails', key).catch(() => null).then(record => {
-        this.thumbLookups.delete(key);
-        if (record?.key !== key || !usableThumbnail(record)) { this.thumbMisses.add(key); return; }
-        this.thumbs.set(key, record.dataUrl);
-        while (this.thumbs.size > 600) this.thumbs.delete(this.thumbs.keys().next().value);
-        schedule();
-      });
-      this.thumbLookups.set(key, lookup);
+      const known = storedThumbnails.peek(key);
+      if (known) return known.dataUrl;
+      safely(storedThumbnails.load(key).then(record => { if (record) schedule(); }));
       return null;
     }
 
     cover(host, box, key, url) {
       const hostRect = host.getBoundingClientRect(), rect = box.getBoundingClientRect();
       if (!hostRect.width || !rect.width || !rect.height) return;
+      const scaleX = box.offsetWidth > 0 ? rect.width / box.offsetWidth : (host.offsetWidth > 0 ? hostRect.width / host.offsetWidth : 1);
+      const scaleY = box.offsetHeight > 0 ? rect.height / box.offsetHeight : (host.offsetHeight > 0 ? hostRect.height / host.offsetHeight : scaleX);
+      const anchor = host.getClientRects?.()[0] || hostRect;
       if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
       const img = document.createElement('img');
       img.dataset.refFastMentionIcon = '';
@@ -3689,19 +4334,47 @@ SOFTWARE.
       img.setAttribute('aria-hidden', 'true');
       img.decoding = 'async';
       img.src = url;
-      Object.assign(img.style, { left: `${rect.left - hostRect.left - host.clientLeft}px`, top: `${rect.top - hostRect.top - host.clientTop}px`,
-        width: `${rect.width}px`, height: `${rect.height}px` });
+      let left = (rect.left - anchor.left) / scaleX - (host.clientLeft || 0);
+      let top = (rect.top - anchor.top) / scaleY - (host.clientTop || 0);
+      Object.assign(img.style, {
+        left: `${left}px`,
+        top: `${top}px`,
+        width: `${rect.width / scaleX}px`,
+        height: `${rect.height / scaleY}px`,
+      });
+      img.onerror = () => {
+        img.remove();
+        if (this.covers.get(host)?.img === img) this.covers.delete(host);
+        storedThumbnails.records.delete(key);
+        storedThumbnails.knownKeys.delete(key);
+      };
       // Mark before inserting so the observer ignores this host's own icon churn and our insertion.
       const cover = { img, key, shaped: false };
       this.covers.set(host, cover);
       this.shape(host, cover);
       host.append(img);
+      if (typeof host.getClientRects === 'function') {
+        const placed = img.getBoundingClientRect();
+        if (placed.width > 0 && Math.abs(placed.width - rect.width) <= 2 && Math.abs(placed.height - rect.height) <= 2) {
+          const dx = rect.left - placed.left;
+          const dy = rect.top - placed.top;
+          if (Math.abs(dx) > 0.25 || Math.abs(dy) > 0.25) {
+            left += dx / scaleX;
+            top += dy / scaleY;
+            img.style.left = `${left}px`;
+            img.style.top = `${top}px`;
+          }
+        }
+      }
       statistics.mentionIconOverlays += 1;
     }
   }
 
   function bindMethods(instance) {
-    const names = Object.getOwnPropertyNames(Object.getPrototypeOf(instance)).filter(name => name !== 'constructor');
+    const proto = Object.getPrototypeOf(instance);
+    const names = Object.getOwnPropertyNames(proto).filter(name =>
+      name !== 'constructor' && typeof Object.getOwnPropertyDescriptor(proto, name)?.value === 'function'
+    );
     return Object.fromEntries(names.map(name => [name, instance[name].bind(instance)]));
   }
 
@@ -3710,24 +4383,25 @@ SOFTWARE.
   const thumbnailCache = new ThumbnailCache(storage);
   const thumbnailLoader = new ThumbnailLoader();
   const nativeBridge = new ChatGPTBridge();
+  const storedThumbnails = new StoredThumbnails();
   const menuController = new ReferenceMenuController(catalogController.index);
   const composerMentions = new ComposerMentions();
   const {
-    indexReferences, clearReferenceIndex, registerReferences, startCatalogSession, loadCatalog, invalidate
+    clearReferenceIndex, registerReferences, startCatalogSession, loadCatalog, invalidate
   } = bindMethods(catalogController);
   const {
     pruneThumbnails, cachedThumbnail, saveThumbnail
   } = bindMethods(thumbnailCache);
   const {
-    downloadReference, scheduleImagePump, waitForMenuImage, settleNativeImages, queueThumbnail, pumpImages
+    downloadReference, scheduleImagePump, waitForMenuImage, queueThumbnail
   } = bindMethods(thumbnailLoader);
   const {
-    releaseNativeImages, beforeReferenceSelection, continueCatalog, selectOneReference
+    releaseNativeImages, beforeReferenceSelection
   } = bindMethods(nativeBridge);
   const {
-    visible, rowLabels, rowReference, findRow, visibleRows, paint, paintFile, updateProgress, showStatus,
-    findReferenceButton, loadHoverPreview, showHoverPreview, positionHoverPreview, previewRow, addSearch,
-    filterRows, scheduleMenuPaint, paintVisible, seedExistingThumbnail, updateMenus, schedule, mount
+    visible, findRow, paint, paintFile, updateProgress, showStatus,
+    findReferenceButton, loadHoverPreview, showHoverPreview,
+    scheduleMenuPaint, updateMenus, schedule, mount
   } = bindMethods(menuController);
   const originalFetch = window.fetch.bind(window);
   const downloads = thumbnailLoader.downloads;
@@ -3756,16 +4430,58 @@ SOFTWARE.
   let verifiedAt = 0;
   let lastButton = null;
   let catalogBarrier = null;
+  let pendingCatalogRoot = null;
   let activeTransport = null;
   let catalogEpoch = 0;
   let catalogError = false;
+  let readOnlyCatalog = null;
   let storageWriteFailed = false;
   let storageWriteConnectionOnly = false;
+  const readOnlyPending = new Set();
+  function holdReadOnlyRequest(file, signal, perform) {
+    return new Promise((resolve, reject) => {
+      const job = { file, signal, settled: false, perform };
+      job.cancel = () => {
+        if (job.settled) return;
+        job.settled = true;
+        readOnlyPending.delete(job);
+        signal?.removeEventListener('abort', job.cancel);
+        reject(new DOMException('Reference preview unmounted', 'AbortError'));
+      };
+      job.release = () => {
+        if (job.settled) return;
+        job.settled = true;
+        readOnlyPending.delete(job);
+        signal?.removeEventListener('abort', job.cancel);
+        Promise.resolve().then(perform).then(resolve, reject);
+      };
+      if (signal?.aborted) { job.cancel(); return; }
+      signal?.addEventListener('abort', job.cancel, { once: true });
+      readOnlyPending.add(job);
+    });
+  }
+  function releaseReadOnlyPending(file) {
+    for (const job of [...readOnlyPending]) {
+      if (file === undefined || job.file === file) job.release();
+    }
+  }
+  function cancelReadOnlyPending() {
+    for (const job of [...readOnlyPending]) job.cancel();
+  }
   const hoverPreview = new HoverPreview({
     cache: new PersistentPreviewCache(storage, { scope: () => activeScope }),
     load: loadHoverPreview, resolve: menuController.resolveHoverPreview.bind(menuController), show: showHoverPreview,
-    hide: () => { if (menuController.previewPanel) { menuController.previewPanel.box.hidden = true; menuController.previewPanel.image.removeAttribute('src'); } },
-    current: context => (context.stored ? Boolean(requestContext) && (requestContext.account ?? null) === context.account :
+    hide: () => {
+      if (menuController.previewPanel) {
+        const { box, image } = menuController.previewPanel;
+        box.hidden = true;
+        image.onload = null;
+        image.onerror = null;
+        image.removeAttribute('src');
+      }
+    },
+    current: context => (context.stored ? (requestContext ? (requestContext.account ?? null) === context.account :
+      Boolean(userId && context.identity === userId)) :
       activeScope === context.scope && activeTransport?.scope === context.scope) &&
       context.container.isConnected && visible(context.row, context.container) && (!context.mention || mentionHighlighted(context.row)),
   });
@@ -3782,8 +4498,10 @@ SOFTWARE.
     load: downloadReference, scope: () => activeScope, changed: updateProgress });
 
   let requestContext = null;
-  let credentialVersion = 0;
   let identitySequence = 0;
+  // Credentials are applied in the order requests were sent, not the order responses arrive,
+  // so a slow request carrying an older token cannot replace a newer one.
+  let credentialRequests = 0, appliedCredentials = 0;
   const cacheSession = new ChatCacheSession({
     storage: {
       getItem: key => window.localStorage.getItem(key), setItem: (key, value) => window.localStorage.setItem(key, value),
@@ -3805,6 +4523,8 @@ SOFTWARE.
     changed: updateProgress,
   });
   storage.onReconnect = () => {
+    storedThumbnails.indexedScopes.clear();
+    storedThumbnails.knownKeys.clear();
     thumbnailCache.reloadAfterReconnect();
     thumbnailLoader.resumeAfterReconnect();
     previewLoader.resumeAfterReconnect();
@@ -3814,25 +4534,57 @@ SOFTWARE.
     return cacheSession.running && cacheSession.chatId === chatIdFor(location.href);
   }
   function syncChatRoute() { cacheSession.route(location.href); }
-  function observeCredentials(headers) {
-    if (!headers.has('Authorization')) return;
-    const clean = new Headers(headers);
-    for (const name of ['x-client-request-id', 'traceparent', 'tracestate']) clean.delete(name);
-    if (requestContext?.headers.get('Authorization') !== clean.get('Authorization')) credentialVersion++;
-    requestContext = { headers: clean, account: clean.get('ChatGPT-Account-ID') };
+  function syncTransportAuth(api, account) {
+    if (requestContext && (requestContext.account ?? null) === (account ?? null)) {
+      api?.setAuthorization?.(requestContext.headers.get('Authorization'));
+    }
+    return api;
+  }
+  function observeCredentials(headers, sequence) {
+    if (!headers.has('Authorization') || sequence < appliedCredentials) return;
+    appliedCredentials = sequence;
+    const clean = cleanRequestHeaders(headers);
+    const account = clean.get('ChatGPT-Account-ID');
+    requestContext = { headers: clean, account };
+    if (activeTransport && (activeAccount ?? null) === (account ?? null)) {
+      activeTransport.api.setAuthorization?.(clean.get('Authorization'));
+    }
     publishCredentials();
   }
   function publishCredentials() {
     if (!userId || !requestContext) return;
-    cacheSession.credentials({ ...requestContext, key: JSON.stringify([userId, requestContext.account, credentialVersion]) });
+    cacheSession.credentials({
+      ...requestContext,
+      key: JSON.stringify([userId, requestContext.account]),
+      authorization: requestContext.headers.get('Authorization'),
+    });
+  }
+
+  function dropCatalogScope(scope, { local = false } = {}) {
+    if (readOnlyCatalog?.scope === scope) readOnlyCatalog = null;
+    if (scope === activeScope) verifiedAt = 0;
+    storedThumbnails.deleteScope(scope);
+    catalogs.delete(scope);
+    collectedSessions.delete(scope);
+    if (local) {
+      if (scope === activeScope) {
+        hoverPreview.close();
+        hoverPreview.cache.clear();
+        inventory.reset();
+        catalogController.indexed = null;
+        catalogError = false;
+        storageWriteFailed = false;
+        storageWriteConnectionOnly = false;
+      }
+      backgroundCatalogs.get(scope)?.controller.abort();
+      backgroundCatalogs.delete(scope);
+    }
   }
 
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('reference-menu-fast-v1') : null;
   channel?.addEventListener('message', event => {
     if (event.data?.type === 'invalidate' && typeof event.data.scope === 'string') {
-      catalogs.delete(event.data.scope);
-      collectedSessions.delete(event.data.scope);
-      if (event.data.scope === activeScope) verifiedAt = 0;
+      dropCatalogScope(event.data.scope, { local: false });
     }
   });
 
@@ -3842,6 +4594,7 @@ SOFTWARE.
 
 
   function setScope(scope) {
+    if (scope) readOnlyCatalog = null;
     if (activeScope !== scope) {
       hoverPreview.close();
       hoverPreview.cache.clear();
@@ -3866,6 +4619,7 @@ SOFTWARE.
       thumbnailFailed.clear();
       thumbnailLoader.storageFailed.clear();
       for (const job of pendingRequests) job.cancel();
+      cancelReadOnlyPending();
       for (const state of mountedMenus.values()) {
         for (const image of state.menu.querySelectorAll('[data-ref-fast-thumbnail]')) image.remove();
         for (const slot of state.menu.querySelectorAll('[data-ref-fast-icon]')) delete slot.dataset.refFastIcon;
@@ -3905,12 +4659,25 @@ SOFTWARE.
     return jsonResponse(catalogBody(record));
   }
 
+  function clearUserSession(credentialSequence, { clearIdentity = false } = {}) {
+    appliedCredentials = Math.max(appliedCredentials, credentialSequence);
+    if (clearIdentity) userId = null;
+    else catalogEpoch += 1;
+    readOnlyCatalog = null;
+    pendingCatalogRoot = null;
+    cancelReadOnlyPending();
+    storedThumbnails.clear();
+    if (!clearIdentity) setScope(null);
+    cacheSession.credentials(null);
+    requestContext = null;
+  }
+
   function handleIdentity(request) {
     const sequence = ++identitySequence;
     return request.perform().then(response => {
       if (sequence !== identitySequence) return response;
       if (!response.ok) {
-        if ([401,403].includes(response.status)) { userId = null; cacheSession.credentials(null); requestContext = null; }
+        if ([401,403].includes(response.status)) clearUserSession(request.credentialSequence, { clearIdentity: true });
         return response;
       }
       safely(response.clone().json().then(me => {
@@ -3919,8 +4686,9 @@ SOFTWARE.
         if (typeof next === 'string' && next !== userId) {
           const changedUser = userId !== null;
           userId = next;
-          if (changedUser) { catalogEpoch += 1; setScope(null); cacheSession.credentials(null); }
+          if (changedUser) clearUserSession(request.credentialSequence, { clearIdentity: false });
         }
+        observeCredentials(request.headers, request.credentialSequence);
         publishCredentials();
       }));
       return response;
@@ -3938,7 +4706,11 @@ SOFTWARE.
     const snapshot = catalogController.records.get(cached.key) || cached;
     setScope(cached.key);
     activeAccount = account;
-    activeTransport = { scope: cached.key, api: referenceTransport(originalFetch, request.input, request.init, location.origin), identity };
+    activeTransport = {
+      scope: cached.key,
+      api: syncTransportAuth(referenceTransport(originalFetch, request.input, request.init, location.origin), account),
+      identity,
+    };
     if (catalogController.indexed !== snapshot) {
       catalogController.indexed = snapshot;
       registerReferences(cached.key, snapshot.pages.flatMap(page => page.items), true);
@@ -3953,9 +4725,10 @@ SOFTWARE.
     const epoch = ++catalogEpoch;
     if (activeScope && activeAccount !== account) setScope(null);
     let releaseCatalog;
-    catalogBarrier = new Promise(resolve => { releaseCatalog = resolve; });
+    const barrier = new Promise(resolve => { releaseCatalog = resolve; });
+    catalogBarrier = barrier;
     try {
-      const api = referenceTransport(originalFetch, request.input, request.init, location.origin);
+      const api = syncTransportAuth(referenceTransport(originalFetch, request.input, request.init, location.origin), account);
       // This bootstrap belongs to the cache worker, not to the popup's signal.
       // Closing the popup must not cancel verification or the remaining pages.
       const firstResponse = await boundedImage(s => api.list(null, s), CONFIG.requestTimeoutSeconds * 1000, cacheSession.controller?.signal);
@@ -3965,11 +4738,12 @@ SOFTWARE.
       const firstBody = await firstResponse.clone().json();
       if (epoch !== catalogEpoch) return firstResponse;
       const owner = Array.isArray(firstBody.items) ? verifiedOwner(firstBody.items) : null;
+      if (Array.isArray(firstBody.items) && firstBody.items.length && !owner) return fail();
       const currentScope = scopeKey(owner || userId, account || 'server-verified');
       if (!currentScope) return fail();
       setScope(currentScope);
       activeAccount = account;
-      activeTransport = { scope: currentScope, api, identity: userId };
+      activeTransport = { scope: currentScope, api: syncTransportAuth(api, account), identity: userId, provisional: !owner };
       let cached = await loadCatalog(currentScope, false);
       if (cached && JSON.stringify(cached.pages[0]?.items) !== JSON.stringify((firstBody.items || []).map(cleanReference))) {
         await invalidate(currentScope);
@@ -3983,7 +4757,7 @@ SOFTWARE.
         safely(catalogController.refreshIfDue(activeTransport, firstBody)?.done);
         return serveCatalog(cached, signal);
       }
-      const worker = startCatalogSession(activeTransport, firstBody);
+      const worker = startCatalogSession(activeTransport, firstBody, { provisional: !owner });
       if (!worker) return firstResponse;
       return jsonResponse(await waitCatalogPage(worker, null, signal));
     } catch (error) {
@@ -3992,7 +4766,18 @@ SOFTWARE.
       if (epoch === catalogEpoch) { catalogError = true; updateProgress(); }
       // Internal cancellation, timeouts or an unexpected body must not fail the app's own request.
       return request.perform();
-    } finally { releaseCatalog(); }
+    } finally {
+      if (catalogBarrier === barrier) catalogBarrier = null;
+      releaseCatalog();
+    }
+  }
+
+  function resolveCatalogRoot(work) {
+    const pending = Promise.resolve().then(work);
+    pendingCatalogRoot = pending;
+    return pending.finally(() => {
+      if (pendingCatalogRoot === pending) pendingCatalogRoot = null;
+    });
   }
 
   // Outside a caching chat (a new chat, Spaces file views, …) the app still loads every reference page in sequence;
@@ -4002,10 +4787,18 @@ SOFTWARE.
   async function serveCatalogReadOnly(request) {
     if (request.url.searchParams.get('cursor') !== null || !userId) return request.perform();
     const epoch = catalogEpoch, identity = userId;
-    const record = await catalogController.cachedForAccount(request.headers.get('ChatGPT-Account-ID'), identity).catch(() => null);
+    const account = request.headers.get('ChatGPT-Account-ID') ?? null;
+    const record = await resolveCatalogRoot(() => catalogController.cachedForAccount(account, identity).catch(() => null));
     if (cacheAllowed()) return handleCatalogList(request);
     if (!record || epoch !== catalogEpoch || identity !== userId) return request.perform();
     request.signal?.throwIfAborted();
+    const items = record.pages.flatMap(page => page.items);
+    readOnlyCatalog = createCatalogSnapshot({ scope: record.key, account, identity, record, items });
+    for (const state of mountedMenus.values()) {
+      menuController.syncReadOnlyRows(state);
+      showStatus(state);
+      scheduleMenuPaint(state);
+    }
     statistics.storedCatalogServes += 1;
     return jsonResponse(catalogBody(record));
   }
@@ -4033,20 +4826,55 @@ SOFTWARE.
     return bootstrapCatalog(request, account);
   }
 
-  // Full-size image requests for rows in an open reference menu share the cache worker's download.
-  async function handleMenuImage(request) {
-    if (Date.now() < nativeBridge.bypassUntil) return request.perform();
-    const file = contentKey(request.url);
+  function menusNeedSync(file) {
+    if (mountedMenus.size === 0 && document.querySelector('[role="menu"]')) return true;
+    for (const state of mountedMenus.values()) {
+      if (!state.menu.isConnected) continue;
+      if (state.lastItemCount !== undefined && state.menu.querySelectorAll('[role="menuitem"]').length !== state.lastItemCount) return true;
+      if (file && !state.rowsByFile?.has?.(file) && !state.readOnlyByFile?.has?.(file) &&
+          state.menu.querySelectorAll('[role="menuitem"]').length !== state.rows.length) return true;
+    }
+    return false;
+  }
+
+  // Image and download-metadata requests for rows in an open reference menu share the cache worker's download
+  // or reuse already-stored thumbnails in read-only views.
+  async function handleMenuImage(request, avatar = menuAvatarRequest(request.url, request.method)) {
+    if (Date.now() < nativeBridge.bypassUntil || !avatar) return null;
+    const { file, kind } = avatar;
     const referenceOpen = mountedMenus.size > 0 || lastButton?.getAttribute('aria-expanded') === 'true';
-    if (file && referenceOpen && catalogBarrier) {
+    if (!cacheAllowed()) {
+      if (referenceOpen && pendingCatalogRoot) {
+        let timer;
+        await Promise.race([pendingCatalogRoot, new Promise(resolve => { timer = setTimeout(resolve, 5000); })]);
+        clearTimeout(timer);
+      }
+      if (menusNeedSync(file)) updateMenus();
+      const hit = menuController.findReadOnlyRow(file);
+      if (!hit) return null;
+      const scope = hit.reference ? menuController.readOnlyScopeFor(hit.reference, hit.state) : null;
+      if (!scope) return null;
+      const key = JSON.stringify([scope, file]);
+      if (!(await storedThumbnails.hasScopeKey(key))) return null;
+      if (request.signal?.aborted) throw new DOMException('Request cancelled', 'AbortError');
+      if (cacheAllowed() || Date.now() < nativeBridge.bypassUntil || !menuController.findReadOnlyRow(file)) return null;
+      return holdReadOnlyRequest(file, request.signal, detachedDownload(originalFetch, request.input, request.init));
+    }
+    if (referenceOpen && catalogBarrier) {
       let timer;
       await Promise.race([catalogBarrier, new Promise(resolve => { timer = setTimeout(resolve, 5000); })]);
       clearTimeout(timer);
     }
-    if (file && referencesByFile.has(file) && mountedMenus.size === 0 && document.querySelector('[role="menu"]')) updateMenus();
-    if (activeScope && file && findRow(file) && !storageWriteFailed) {
-      const backgroundFetch = detachedDownload(originalFetch, request.input, request.init);
-      return waitForMenuImage(file, request.signal, backgroundFetch, activeScope);
+    if (menusNeedSync(file)) updateMenus();
+    if (activeScope && findRow(file) && !storageWriteFailed) {
+      const perform = detachedDownload(originalFetch, request.input, request.init);
+      const source = kind === 'metadata' ? referenceSources.get(file) : null;
+      const download = kind === 'metadata'
+        ? (source && source.transport.scope === activeScope
+          ? signal => downloadReference(source.reference, source.transport, signal)
+          : null)
+        : perform;
+      return waitForMenuImage(file, request.signal, download, activeScope, kind, perform);
     }
     return null;
   }
@@ -4056,7 +4884,7 @@ SOFTWARE.
     const { url, method } = request;
     if (response.ok) cacheSession.deleted(await deletedId);
     if (method === 'GET' && [404,410].includes(response.status)) {
-      const missing = url.pathname.match(/^\/backend-api\/conversation\/([a-zA-Z0-9_-]+)$/)?.[1];
+      const missing = conversationIdFromPath(url.pathname);
       if (missing === cacheSession.chatId) cacheSession.deleted(missing);
     }
     if (response.ok && method !== 'GET' && url.pathname.startsWith(LIST_PATH)) {
@@ -4074,32 +4902,47 @@ SOFTWARE.
     const headers = new Headers(input instanceof Request ? input.headers : undefined);
     new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
     const request = { input, init, url, method, headers, signal: init?.signal || (input instanceof Request ? input.signal : undefined),
-      perform: () => originalFetch(input, init) };
+      credentialSequence: ++credentialRequests, perform: () => originalFetch(input, init) };
 
-    if (method === 'GET' && url.pathname.startsWith('/backend-api/') && url.pathname !== LIST_PATH) observeCredentials(headers);
     const deletedId = deletedChatId(url, method, input, init);
 
     if (method === 'GET' && url.pathname === '/backend-api/me') return handleIdentity(request);
     if (method === 'GET' && url.pathname === LIST_PATH) return handleCatalogList(request);
-    if (cacheAllowed() && method === 'GET' && url.pathname === '/backend-api/estuary/content') {
-      const image = await handleMenuImage(request);
+    const avatar = menuAvatarRequest(url, method);
+    if (avatar) {
+      const image = await handleMenuImage(request, avatar);
       if (image) return image;
     }
     const response = await request.perform();
+    if (response.ok && method === 'GET' && url.pathname.startsWith('/backend-api/') && url.pathname !== LIST_PATH) {
+      observeCredentials(headers, request.credentialSequence);
+    }
     await observeResponse(request, response, deletedId);
     return response;
   };
 
 
+  let routeTimer = null;
+  function updateRouteTimer() {
+    const active = cacheSession.pageActive && !document.hidden;
+    if (active && routeTimer === null && window.setInterval) {
+      routeTimer = window.setInterval(syncChatRoute, 1000);
+      routeTimer?.unref?.();
+    } else if (!active && routeTimer !== null) {
+      window.clearInterval?.(routeTimer);
+      routeTimer = null;
+    }
+  }
   for (const method of ['pushState', 'replaceState']) if (window.history?.[method]) {
     const original = window.history[method];
     window.history[method] = function (...args) { const result = original.apply(this, args); syncChatRoute(); return result; };
   }
   window.addEventListener?.('popstate', syncChatRoute);
-  window.addEventListener?.('pageshow', () => { cacheSession.pageActive = true; syncChatRoute(); cacheSession.resume(); });
-  window.addEventListener?.('pagehide', () => { cacheSession.pageActive = false; cacheSession.suspend(); });
+  window.addEventListener?.('pageshow', () => { cacheSession.pageActive = true; syncChatRoute(); cacheSession.resume(); updateRouteTimer(); });
+  window.addEventListener?.('pagehide', () => { cacheSession.pageActive = false; cacheSession.suspend(); updateRouteTimer(); });
+  document.addEventListener?.('visibilitychange', () => { if (!document.hidden) syncChatRoute(); updateRouteTimer(); });
   window.addEventListener?.('storage', event => cacheSession.external(event.key));
-  window.setInterval?.(syncChatRoute, 1000);
+  updateRouteTimer();
   syncChatRoute();
 
   const focusGate = new ReferenceFocusGate(() => mountedMenus.keys(), window);
@@ -4128,9 +4971,9 @@ SOFTWARE.
 
   // Small diagnostics for local verification. Reference names, credentials and URLs are not exposed here.
   Object.defineProperty(window, '__referenceMenuFastStatus', {
-    value: () => ({ ...statistics, version: '1.0.0', menuCount: mountedMenus.size, waitingImages: pendingRequests.size,
+    value: () => ({ ...statistics, version: '1.0.1', menuCount: mountedMenus.size, waitingImages: pendingRequests.size,
       windowBlurReleases: focusGate.windowBlurReleases, hoverPreviewOpen: Boolean(hoverPreview.target), hoverPreviewCached: hoverPreview.cache.entries.size,
-      backgroundQueued: downloads.jobs.length, activeDownloads: downloads.active,
+      backgroundQueued: downloads.size, activeDownloads: downloads.active,
       activeBackgroundDownloads: downloads.activeBackground,
       thumbnailsReady: inventory.summary().ready, thumbnailsFailed: inventory.summary().failed,
       thumbnailProgress: inventory.summary(), catalogFetchFailed: catalogError, cacheStorageFailed: storageWriteFailed,

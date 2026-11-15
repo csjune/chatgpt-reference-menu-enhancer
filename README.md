@@ -19,12 +19,14 @@ A userscript that makes the reference-image menu on ChatGPT images faster to use
 
 Your userscript manager keeps the script up to date. To install it by hand instead, create a new script with the full contents of [chatgpt-reference-menu.user.js](chatgpt-reference-menu.user.js).
 
+A Firefox extension built from the same script is being prepared and is not on addons.mozilla.org yet. To try it now, run `node scripts/build-extension.mjs` and load `dist/firefox/manifest.json` from `about:debugging`. A temporary add-on is removed when Firefox closes. Keep only one of the extension and the userscript enabled.
+
 ## How to use
 
 1. In a saved chat, click a generated image's reference icon, or type @ in the message box. Either one starts saving references for that chat.
 2. Type part of a name or code in the search field. Hover over or focus an item to see its preview.
 3. As usual, select a reference under **Recreate with**.
-4. Click ↻ to get the latest list. Clicking it again while it is updating starts over.
+4. Click ↻ to get the latest list and retry any failed images. Clicking it again while it is updating starts over.
 
 The menu still closes when you click outside it, press Escape, click the reference icon again or finish a selection. Saving keeps going after the menu closes. It pauses when you leave the chat and picks up again in the last **five chats** where you opened the menu or the @ mention suggestions.
 
@@ -47,5 +49,5 @@ The menu still closes when you click outside it, press Escape, click the referen
 ## More
 
 - [Development and local verification](docs/DEVELOPMENT.md): tests, the mock page and version history.
-- [Greasy Fork page](https://greasyfork.org/scripts/605271). Its descriptions in ten languages are kept in [greasyfork/](greasyfork/).
+- [Greasy Fork page](https://greasyfork.org/scripts/605271). It syncs the script and its descriptions in ten languages ([greasyfork/](greasyfork/)) from this repository's `main` branch.
 - License: [MIT](LICENSE)
